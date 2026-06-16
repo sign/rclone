@@ -48,6 +48,7 @@ import (
 	_ "github.com/rclone/rclone/backend/onedrive"
 	_ "github.com/rclone/rclone/backend/opendrive"
 	_ "github.com/rclone/rclone/backend/oracleobjectstorage"
+	_ "github.com/rclone/rclone/backend/overlay"
 	_ "github.com/rclone/rclone/backend/pcloud"
 	_ "github.com/rclone/rclone/backend/pikpak"
 	_ "github.com/rclone/rclone/backend/pixeldrain"
