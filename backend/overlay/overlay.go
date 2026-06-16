@@ -96,11 +96,24 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		}
 	}
 
-	// open both upstreams; fs.ErrorIsFile is not fatal (root points at a file)
+	// open the authoritative list upstream first; fs.ErrorIsFile is not fatal (root is a file)
 	listFs, errList := resolveUpstream(ctx, opt.ListRemote, root)
 	if errList != nil && errList != fs.ErrorIsFile {
 		return nil, fmt.Errorf("overlay: failed to open list_remote %q: %w", opt.ListRemote, errList)
 	}
+
+	// when the list root is a file the backend rooted listFs at the parent dir and returned
+	// ErrorIsFile (mirrors crypt). correct our root and open read_remote at the SAME parent so
+	// keys line up - opening read_remote at the original file path is wrong unless it also
+	// returns ErrorIsFile (a plain read remote with the key missing roots one level too deep,
+	// so readFs.NewObject would look up <key>/<key>).
+	if errList == fs.ErrorIsFile {
+		root = path.Dir(root)
+		if root == "." || root == "/" {
+			root = ""
+		}
+	}
+
 	readFs, errRead := resolveUpstream(ctx, opt.ReadRemote, root)
 	if errRead != nil && errRead != fs.ErrorIsFile {
 		return nil, fmt.Errorf("overlay: failed to open read_remote %q: %w", opt.ReadRemote, errRead)
@@ -122,14 +135,6 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		cache.Unpin(f.listFs)
 		cache.Unpin(f.readFs)
 	})
-
-	// the list upstream is authoritative; mirror crypt's root correction when it is a file
-	if errList == fs.ErrorIsFile {
-		f.root = path.Dir(f.root)
-		if f.root == "." || f.root == "/" {
-			f.root = ""
-		}
-	}
 
 	f.features = (&fs.Features{
 		ReadMimeType: true,
