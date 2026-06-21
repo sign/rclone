@@ -304,6 +304,44 @@ This remote supports `--fast-list` which allows you to use fewer
 transactions in exchange for more memory. See the [rclone
 docs](/docs/#fast-list) for more details.
 
+### Listing from a BigQuery inventory table
+
+For very large buckets the Cloud Storage list API can be slow and costly.
+If you have a [GCS Storage Insights inventory
+report](https://cloud.google.com/storage/docs/insights/inventory-reports)
+loaded into BigQuery, set `bigquery_table` to serve all listings (both
+single-level browsing and recursive `--fast-list`) from that table instead
+of the list API. Object **downloads** still go through Cloud Storage.
+
+    [gcs]
+    type = google cloud storage
+    service_account_file = /path/to/sa.json
+    bigquery_table = my-project.inventory.gcs_objects
+
+The table must have columns `bucket`, `name`, `size`, `md5Hash`, `updated`
+and `snapshotTime`. Each listing query pins to the latest `snapshotTime`
+for the bucket, so results reflect the most recent report - which lags live
+bucket state, so an object written since the last report won't appear until
+the next one runs.
+
+Notes:
+
+- Listing a directory with very many objects is bounded by BigQuery's REST
+  result API (`getQueryResults`), which returns large result sets slowly -
+  e.g. a flat directory of ~100k objects takes tens of seconds even though
+  the query itself runs in a few seconds. Under `rclone mount` this only
+  bites the first listing of such a directory; raise `--dir-cache-time` so
+  it is served from cache afterwards. (A faster path via the BigQuery Storage
+  Read API is possible but would add a dependency.)
+- This needs a BigQuery read scope in addition to the storage scope. With a
+  service account or `env_auth` it is requested automatically; with
+  interactive oauth you must `rclone config reconnect` to re-consent.
+- The query runs in (and is billed to) the project from
+  `bigquery_billing_project`, or a fully-qualified `project.dataset.table`,
+  or the service account's `project_id`.
+- This is most useful behind the [overlay](/overlay/) backend, listing a GCS
+  origin while reading object data from another remote.
+
 ### Custom upload headers
 
 You can set custom upload headers with the `--header-upload`
@@ -820,6 +858,42 @@ Properties:
 - Env Var:     RCLONE_GCS_ENCODING
 - Type:        Encoding
 - Default:     Slash,CrLf,InvalidUtf8,Dot
+
+#### --gcs-bigquery-table
+
+BigQuery table holding a GCS Storage Insights inventory report.
+
+If set, object listings (both single-level and recursive) are served by querying
+this table instead of the Cloud Storage list API - useful for very large buckets.
+Give a fully-qualified `project.dataset.table` (or `dataset.table` with
+bigquery_billing_project set). The table must have columns: bucket, name, size,
+md5Hash, updated, snapshotTime. Each query pins to the latest snapshotTime per
+bucket, so listings reflect the most recent inventory report (which lags live
+bucket state). Object downloads still go through Cloud Storage.
+
+This needs a BigQuery read scope in addition to the storage scope; with oauth
+(not service account/env auth) you must reconnect to re-consent.
+
+Properties:
+
+- Config:      bigquery_table
+- Env Var:     RCLONE_GCS_BIGQUERY_TABLE
+- Type:        string
+- Required:    false
+
+#### --gcs-bigquery-billing-project
+
+Project that runs and is billed for bigquery_table queries.
+
+Leave blank to infer it from a fully-qualified bigquery_table, or from the
+service account credentials' project_id.
+
+Properties:
+
+- Config:      bigquery_billing_project
+- Env Var:     RCLONE_GCS_BIGQUERY_BILLING_PROJECT
+- Type:        string
+- Required:    false
 
 #### --gcs-description
 
