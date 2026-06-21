@@ -138,6 +138,7 @@ func (f *Fs) listBQ(ctx context.Context, bucketName, directory, prefix string, a
 		rows      []*bigquery.TableRow
 		pageToken string
 		started   bool
+		found     int
 	)
 	for {
 		if !started {
@@ -197,11 +198,17 @@ func (f *Fs) listBQ(ctx context.Context, bucketName, directory, prefix string, a
 			if err := fn(remote, object, isDirectory); err != nil {
 				return err
 			}
+			found++
 		}
 
 		if pageToken == "" {
 			break
 		}
+	}
+	// BigQuery returns zero rows for a missing bucket/directory the same as for an
+	// empty one, so reproduce the Cloud Storage list path's fs.ErrorDirNotFound.
+	if found == 0 {
+		return f.bqVerifyNotFound(ctx, bucketName, directory)
 	}
 	return nil
 }

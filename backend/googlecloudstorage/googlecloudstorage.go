@@ -839,6 +839,39 @@ func (f *Fs) list(ctx context.Context, bucket, directory, prefix string, addBuck
 	return nil
 }
 
+// bqVerifyNotFound reproduces the Cloud Storage list path's fs.ErrorDirNotFound
+// semantics when a BigQuery listing comes back empty. BigQuery can't tell a missing
+// bucket/directory from an empty one, so probe via the list API: a 404 means the
+// bucket is absent, and (with directory_markers) a non-root directory with no marker
+// is absent too. Only called on an empty result, so it adds no cost to normal lists.
+func (f *Fs) bqVerifyNotFound(ctx context.Context, bucket, directory string) error {
+	err := f.pacer.Call(func() (bool, error) {
+		list := f.svc.Objects.List(bucket).MaxResults(1)
+		if f.opt.UserProject != "" {
+			list = list.UserProject(f.opt.UserProject)
+		}
+		_, err := list.Context(ctx).Do()
+		return shouldRetry(ctx, err)
+	})
+	if err != nil {
+		if gErr, ok := err.(*googleapi.Error); ok && gErr.Code == http.StatusNotFound {
+			return fs.ErrorDirNotFound
+		}
+		return err
+	}
+	f.cache.MarkOK(bucket)
+	if f.opt.DirectoryMarkers && directory != "" {
+		// directory exists only if it has a marker object
+		if _, err := f.readObjectInfo(ctx, bucket, directory); err != nil {
+			if err == fs.ErrorObjectNotFound {
+				return fs.ErrorDirNotFound
+			}
+			return err
+		}
+	}
+	return nil
+}
+
 // Convert a list item into a DirEntry
 func (f *Fs) itemToDirEntry(ctx context.Context, remote string, object *storage.Object, isDirectory bool) (fs.DirEntry, error) {
 	if isDirectory {
