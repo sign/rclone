@@ -43,6 +43,7 @@ import (
 	"github.com/rclone/rclone/lib/pacer"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
+	bigquery "google.golang.org/api/bigquery/v2"
 	"google.golang.org/api/googleapi"
 	option "google.golang.org/api/option"
 
@@ -58,6 +59,7 @@ const (
 	metaMtimeGsutil             = "goog-reserved-file-mtime" // key used by GSUtil to store mtime in metadata
 	listChunks                  = 1000                       // chunk size to read directory listings
 	minSleep                    = 10 * time.Millisecond
+	bigQueryReadonlyScope       = "https://www.googleapis.com/auth/bigquery.readonly" // not exported by bigquery/v2
 )
 
 var (
@@ -384,6 +386,28 @@ endpoint configuration.`,
 				Value: "true",
 				Help:  "Get GCP IAM credentials from the environment (env vars or IAM).",
 			}},
+		}, {
+			Name:     "bigquery_table",
+			Advanced: true,
+			Help: `BigQuery table holding a GCS Storage Insights inventory report.
+
+If set, object listings (both single-level and recursive) are served by querying
+this table instead of the Cloud Storage list API - useful for very large buckets.
+Give a fully-qualified ` + "`project.dataset.table`" + ` (or ` + "`dataset.table`" + ` with
+bigquery_billing_project set). The table must have columns: bucket, name, size,
+md5Hash, updated, snapshotTime. Each query pins to the latest snapshotTime per
+bucket, so listings reflect the most recent inventory report (which lags live
+bucket state). Object downloads still go through Cloud Storage.
+
+This needs a BigQuery read scope in addition to the storage scope; with oauth
+(not service account/env auth) you must reconnect to re-consent.`,
+		}, {
+			Name:     "bigquery_billing_project",
+			Advanced: true,
+			Help: `Project that runs and is billed for bigquery_table queries.
+
+Leave blank to infer it from a fully-qualified bigquery_table, or from the
+service account credentials' project_id.`,
 		}}...),
 	})
 }
@@ -407,21 +431,25 @@ type Options struct {
 	EnvAuth                   bool                 `config:"env_auth"`
 	DirectoryMarkers          bool                 `config:"directory_markers"`
 	AccessToken               string               `config:"access_token"`
+	BigQueryTable             string               `config:"bigquery_table"`
+	BigQueryBillingProject    string               `config:"bigquery_billing_project"`
 }
 
 // Fs represents a remote storage server
 type Fs struct {
-	name           string           // name of this remote
-	root           string           // the path we are working on if any
-	opt            Options          // parsed options
-	features       *fs.Features     // optional features
-	svc            *storage.Service // the connection to the storage server
-	client         *http.Client     // authorized client
-	rootBucket     string           // bucket part of root (if any)
-	rootDirectory  string           // directory part of root (if any)
-	cache          *bucket.Cache    // cache of bucket status
-	pacer          *fs.Pacer        // To pace the API calls
-	warnCompressed sync.Once        // warn once about compressed files
+	name           string            // name of this remote
+	root           string            // the path we are working on if any
+	opt            Options           // parsed options
+	features       *fs.Features      // optional features
+	svc            *storage.Service  // the connection to the storage server
+	client         *http.Client      // authorized client
+	rootBucket     string            // bucket part of root (if any)
+	rootDirectory  string            // directory part of root (if any)
+	cache          *bucket.Cache     // cache of bucket status
+	pacer          *fs.Pacer         // To pace the API calls
+	warnCompressed sync.Once         // warn once about compressed files
+	bqSvc          *bigquery.Service // BigQuery client, non-nil only when listing from bigquery_table
+	bqProject      string            // project that runs/bills the inventory query
 }
 
 // Object describes a storage object
@@ -514,8 +542,8 @@ func (o *Object) split() (bucket, bucketPath string) {
 	return o.fs.split(o.remote)
 }
 
-func getServiceAccountClient(ctx context.Context, credentialsData []byte) (*http.Client, error) {
-	conf, err := google.JWTConfigFromJSON(credentialsData, storageConfig.Scopes...)
+func getServiceAccountClient(ctx context.Context, credentialsData []byte, scopes []string) (*http.Client, error) {
+	conf, err := google.JWTConfigFromJSON(credentialsData, scopes...)
 	if err != nil {
 		return nil, fmt.Errorf("error processing credentials: %w", err)
 	}
@@ -554,26 +582,46 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		}
 		opt.ServiceAccountCredentials = string(loadedCreds)
 	}
+	// when listing from a BigQuery inventory table we also need a BigQuery read
+	// scope. it must be baked into the token source here: option.WithScopes is a
+	// no-op once the client is handed to a service via option.WithHTTPClient.
+	saScopes := append([]string(nil), storageConfig.Scopes...)
+	envScopes := []string{storage.DevstorageFullControlScope}
+	if opt.BigQueryTable != "" {
+		saScopes = append(saScopes, bigQueryReadonlyScope)
+		envScopes = append(envScopes, bigQueryReadonlyScope)
+	}
+
 	if opt.Anonymous {
+		if opt.BigQueryTable != "" {
+			return nil, errors.New("bigquery_table can't be used with anonymous access")
+		}
 		oAuthClient = fshttp.NewClient(ctx)
 	} else if opt.ServiceAccountCredentials != "" {
-		oAuthClient, err = getServiceAccountClient(ctx, []byte(opt.ServiceAccountCredentials))
+		oAuthClient, err = getServiceAccountClient(ctx, []byte(opt.ServiceAccountCredentials), saScopes)
 		if err != nil {
 			return nil, fmt.Errorf("failed configuring Google Cloud Storage Service Account: %w", err)
 		}
 	} else if opt.EnvAuth {
-		oAuthClient, err = google.DefaultClient(ctx, storage.DevstorageFullControlScope)
+		oAuthClient, err = google.DefaultClient(ctx, envScopes...)
 		if err != nil {
 			return nil, fmt.Errorf("failed to configure Google Cloud Storage: %w", err)
 		}
 	} else if opt.AccessToken != "" {
+		// a supplied access_token must already carry the bigquery scope when bigquery_table is set
 		ts := oauth2.Token{AccessToken: opt.AccessToken}
 		oAuthClient = oauth2.NewClient(ctx, oauth2.StaticTokenSource(&ts))
 	} else {
-		oAuthClient, _, err = oauthutil.NewClient(ctx, name, m, storageConfig)
+		oauthCfg := storageConfig
+		if opt.BigQueryTable != "" {
+			cfgCopy := *storageConfig
+			cfgCopy.Scopes = saScopes
+			oauthCfg = &cfgCopy
+		}
+		oAuthClient, _, err = oauthutil.NewClient(ctx, name, m, oauthCfg)
 		if err != nil {
 			ctx := context.Background()
-			oAuthClient, err = google.DefaultClient(ctx, storage.DevstorageFullControlScope)
+			oAuthClient, err = google.DefaultClient(ctx, envScopes...)
 			if err != nil {
 				return nil, fmt.Errorf("failed to configure Google Cloud Storage: %w", err)
 			}
@@ -607,6 +655,18 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	f.svc, err = storage.NewService(context.Background(), gcsOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("couldn't create Google Cloud Storage client: %w", err)
+	}
+
+	if opt.BigQueryTable != "" {
+		f.bqProject, err = resolveBQProject(opt)
+		if err != nil {
+			return nil, err
+		}
+		// no custom endpoint: opt.Endpoint is storage-only and doesn't apply to BigQuery
+		f.bqSvc, err = bigquery.NewService(ctx, option.WithHTTPClient(f.client))
+		if err != nil {
+			return nil, fmt.Errorf("couldn't create BigQuery client: %w", err)
+		}
 	}
 
 	if f.rootBucket != "" && f.rootDirectory != "" {
@@ -661,6 +721,32 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 // listFn is called from list to handle an object.
 type listFn func(remote string, object *storage.Object, isDirectory bool) error
 
+// objectRemote maps a raw GCS object name to its listing-relative remote, applying
+// the same encoding, prefix-stripping and directory-marker handling for both the
+// Cloud Storage list path and the BigQuery list path. skip is true for odd names
+// (wrong prefix) and for the listed directory itself.
+func (f *Fs) objectRemote(name, directory, prefix, bucketName string, addBucket bool) (remote string, isDirectory, skip bool) {
+	remote = f.opt.Enc.ToStandardPath(name)
+	if !strings.HasPrefix(remote, prefix) {
+		fs.Logf(f, "Odd name received %q", name)
+		return "", false, true
+	}
+	isDirectory = remote == "" || strings.HasSuffix(remote, "/")
+	if isDirectory {
+		// don't insert the listed directory itself
+		if remote == f.opt.Enc.ToStandardPath(directory) {
+			return "", true, true
+		}
+		// process directory markers as directories
+		remote, _ = strings.CutSuffix(remote, "/")
+	}
+	remote = remote[len(prefix):]
+	if addBucket {
+		remote = path.Join(bucketName, remote)
+	}
+	return remote, isDirectory, false
+}
+
 // list the objects into the function supplied
 //
 // dir is the starting directory, "" for root
@@ -675,6 +761,9 @@ func (f *Fs) list(ctx context.Context, bucket, directory, prefix string, addBuck
 	}
 	if directory != "" {
 		directory += "/"
+	}
+	if f.bqSvc != nil {
+		return f.listBQ(ctx, bucket, directory, prefix, addBucket, recurse, fn)
 	}
 	list := f.svc.Objects.List(bucket).Prefix(directory).MaxResults(listChunks)
 	if f.opt.UserProject != "" {
@@ -722,26 +811,10 @@ func (f *Fs) list(ctx context.Context, bucket, directory, prefix string, addBuck
 		}
 		foundItems += len(objects.Items)
 		for _, object := range objects.Items {
-			remote := f.opt.Enc.ToStandardPath(object.Name)
-			if !strings.HasPrefix(remote, prefix) {
-				fs.Logf(f, "Odd name received %q", object.Name)
+			remote, isDirectory, skip := f.objectRemote(object.Name, directory, prefix, bucket, addBucket)
+			if skip {
 				continue
 			}
-			isDirectory := remote == "" || strings.HasSuffix(remote, "/")
-			// is this a directory marker?
-			if isDirectory {
-				// Don't insert the root directory
-				if remote == f.opt.Enc.ToStandardPath(directory) {
-					continue
-				}
-				// process directory markers as directories
-				remote, _ = strings.CutSuffix(remote, "/")
-			}
-			remote = remote[len(prefix):]
-			if addBucket {
-				remote = path.Join(bucket, remote)
-			}
-
 			err = fn(remote, object, isDirectory)
 			if err != nil {
 				return err
@@ -1383,6 +1456,17 @@ func (o *Object) Storable() bool {
 
 // Open an object for read
 func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.ReadCloser, err error) {
+	// objects discovered via the BigQuery inventory table carry no MediaLink, so a
+	// direct gcs: download has no URL to GET. fetch the real object info once to fill
+	// it in (readMetaData would short-circuit here since the BigQuery row already set
+	// modTime). the overlay backend reads via its read_remote, so it never hits this.
+	if o.url == "" {
+		info, err := o.readObjectInfo(ctx)
+		if err != nil {
+			return nil, err
+		}
+		o.setMetaData(info)
+	}
 	url := o.url
 	if o.fs.opt.UserProject != "" {
 		url += "&userProject=" + o.fs.opt.UserProject
