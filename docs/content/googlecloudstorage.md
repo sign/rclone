@@ -326,6 +326,13 @@ the next one runs.
 
 Notes:
 
+- Listing a directory with very many objects is bounded by BigQuery's REST
+  result API (`getQueryResults`), which returns large result sets slowly -
+  e.g. a flat directory of ~100k objects takes tens of seconds even though
+  the query itself runs in a few seconds. Under `rclone mount` this only
+  bites the first listing of such a directory; raise `--dir-cache-time` so
+  it is served from cache afterwards. (A faster path via the BigQuery Storage
+  Read API is possible but would add a dependency.)
 - This needs a BigQuery read scope in addition to the storage scope. With a
   service account or `env_auth` it is requested automatically; with
   interactive oauth you must `rclone config reconnect` to re-consent.

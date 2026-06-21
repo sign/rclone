@@ -18,6 +18,12 @@ import (
 	storage "google.golang.org/api/storage/v1"
 )
 
+// bqPageSize is the row count requested per BigQuery results page. Deliberately
+// large: getQueryResults caps each response at ~10MB and returns a pageToken for
+// the rest, so a high value just minimises round-trips (a flat 100k-object
+// directory then needs a handful of pages instead of ~100 at 1000/page).
+const bqPageSize = 100000
+
 // bqTableRe guards the table reference before it is interpolated into SQL (BigQuery
 // can't bind table names as query parameters). project ids allow dashes; dataset
 // and table names are alphanumeric + underscore; the parts are dot-separated.
@@ -123,7 +129,7 @@ func (f *Fs) listBQ(ctx context.Context, bucketName, directory, prefix string, a
 		UseLegacySql:    &useLegacy,
 		ParameterMode:   "NAMED",
 		QueryParameters: params,
-		MaxResults:      listChunks,
+		MaxResults:      bqPageSize,
 	}
 
 	var (
@@ -150,7 +156,7 @@ func (f *Fs) listBQ(ctx context.Context, bucketName, directory, prefix string, a
 			// poll a still-running job, or fetch the next page of a complete one
 			var resp *bigquery.GetQueryResultsResponse
 			if err := f.pacer.Call(func() (bool, error) {
-				call := f.bqSvc.Jobs.GetQueryResults(jobRef.ProjectId, jobRef.JobId).MaxResults(listChunks).Context(ctx)
+				call := f.bqSvc.Jobs.GetQueryResults(jobRef.ProjectId, jobRef.JobId).MaxResults(bqPageSize).Context(ctx)
 				if jobRef.Location != "" {
 					call = call.Location(jobRef.Location) // required for non-US/EU datasets
 				}
