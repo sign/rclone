@@ -48,12 +48,17 @@ func resolveBQProject(opt *Options) (string, error) {
 	return "", errors.New("can't determine BigQuery billing project: set bigquery_billing_project or use a fully-qualified project.dataset.table")
 }
 
-// bqParam builds a named STRING query parameter.
+// bqParam builds a named STRING query parameter. ForceSendFields keeps an empty
+// Value in the request - otherwise omitempty drops it and BigQuery binds the
+// parameter as NULL, which makes STARTS_WITH/SUBSTR(@dir) match nothing at the root.
 func bqParam(name, value string) *bigquery.QueryParameter {
 	return &bigquery.QueryParameter{
-		Name:           name,
-		ParameterType:  &bigquery.QueryParameterType{Type: "STRING"},
-		ParameterValue: &bigquery.QueryParameterValue{Value: value},
+		Name:          name,
+		ParameterType: &bigquery.QueryParameterType{Type: "STRING"},
+		ParameterValue: &bigquery.QueryParameterValue{
+			Value:           value,
+			ForceSendFields: []string{"Value"},
+		},
 	}
 }
 
@@ -61,7 +66,9 @@ func bqParam(name, value string) *bigquery.QueryParameter {
 //
 // Every query pins to the latest snapshotTime for the bucket, so listings reflect
 // the most recent inventory report. updated is formatted to RFC3339Nano so it drops
-// straight into storage.Object.Updated and is parsed by setMetaData unchanged.
+// straight into storage.Object.Updated; md5Hash is converted from the inventory's
+// hex to base64 so both are parsed by setMetaData unchanged (it base64-decodes the
+// hash and RFC3339-parses the time).
 //
 // Recursive lists every object under @dir. Single-level returns objects directly in
 // @dir plus a synthesized row per immediate sub-directory (name ending in "/", which
@@ -71,25 +78,26 @@ func (f *Fs) bqListQuery(bucketName, directory string, recurse bool) (string, []
 	tbl := f.opt.BigQueryTable
 	params := []*bigquery.QueryParameter{bqParam("bucket", bucketName), bqParam("dir", directory)}
 	const ts = "FORMAT_TIMESTAMP('%Y-%m-%dT%H:%M:%E*SZ', updated)"
+	const md5 = "TO_BASE64(FROM_HEX(md5Hash))" // Storage Insights stores md5Hash as hex; setMetaData wants base64
 	latest := fmt.Sprintf("snapshotTime = (SELECT MAX(snapshotTime) FROM `%s` WHERE bucket = @bucket)", tbl)
 
 	if recurse {
 		sql := fmt.Sprintf(
-			"SELECT name, size, md5Hash, %s AS updated "+
+			"SELECT name, size, %s AS md5Hash, %s AS updated "+
 				"FROM `%s` WHERE bucket = @bucket AND STARTS_WITH(name, @dir) AND %s",
-			ts, tbl, latest)
+			md5, ts, tbl, latest)
 		return sql, params
 	}
 
 	sql := fmt.Sprintf(
-		"WITH rel AS ("+
-			"SELECT name, size, md5Hash, %s AS updated, SUBSTR(name, LENGTH(@dir)+1) AS rel "+
+		"WITH objs AS ("+
+			"SELECT name, size, %s AS md5Hash, %s AS updated, SUBSTR(name, LENGTH(@dir)+1) AS rel "+
 			"FROM `%s` WHERE bucket = @bucket AND STARTS_WITH(name, @dir) AND %s) "+
-			"SELECT name, size, md5Hash, updated FROM rel WHERE STRPOS(rel, '/') = 0 "+
+			"SELECT name, size, md5Hash, updated FROM objs WHERE STRPOS(rel, '/') = 0 "+
 			"UNION DISTINCT "+
 			"SELECT CONCAT(@dir, REGEXP_EXTRACT(rel, r'^[^/]+/')), CAST(0 AS INT64), CAST(NULL AS STRING), CAST(NULL AS STRING) "+
-			"FROM rel WHERE STRPOS(rel, '/') > 0",
-		ts, tbl, latest)
+			"FROM objs WHERE STRPOS(rel, '/') > 0",
+		md5, ts, tbl, latest)
 	return sql, params
 }
 
@@ -177,7 +185,7 @@ func (f *Fs) listBQ(ctx context.Context, bucketName, directory, prefix string, a
 			object := &storage.Object{Name: name}
 			if !isDirectory {
 				object.Size, _ = strconv.ParseUint(cellString(row.F[1]), 10, 64)
-				object.Md5Hash = cellString(row.F[2]) // inventory md5Hash is base64, as setMetaData expects
+				object.Md5Hash = cellString(row.F[2]) // base64 (converted from the inventory's hex in SQL), as setMetaData expects
 				object.Updated = cellString(row.F[3])
 			}
 			if err := fn(remote, object, isDirectory); err != nil {
