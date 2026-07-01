@@ -196,7 +196,6 @@ func (f *Fs) listBQ(ctx context.Context, bucketName, directory, prefix string, a
 // the cache and feeds its caller from the same stream. Rows come from src
 // (BigQuery in production). Caller must hold bqPopMu.
 func (f *Fs) bqPopulate(ctx context.Context, bucketName, directory, prefix string, addBucket bool, fn listFn, src bqRowSource) error {
-	fs.Debugf(f, "BigQuery listing cache: populating %q from BigQuery", bucketName)
 	// pick the next generation and start it empty (clears any aborted attempt)
 	var newGen uint64
 	if err := f.bqDB.Update(func(tx *bolt.Tx) error {
@@ -266,13 +265,13 @@ func (f *Fs) bqPopulate(ctx context.Context, bucketName, directory, prefix strin
 		_ = f.bqDB.Update(func(tx *bolt.Tx) error {
 			return tx.DeleteBucket(bqDataBucket(bucketName, newGen))
 		})
-		fs.Debugf(f, "BigQuery listing cache: query returned no rows, kept existing cache for %q", bucketName)
+		fs.Infof(f, "BigQuery listing cache: query returned no rows, kept existing cache for %q", bucketName)
 		if fn != nil && found == 0 {
 			return f.bqNotFound(ctx, bucketName, directory)
 		}
 		return nil
 	}
-	fs.Debugf(f, "BigQuery listing cache: populated %q with %d objects (gen %d)", bucketName, written, newGen)
+	fs.Infof(f, "BigQuery listing cache: populated %q with %d objects (gen %d)", bucketName, written, newGen)
 
 	// atomic flip + drop the old generation
 	return f.bqDB.Update(func(tx *bolt.Tx) error {
@@ -359,7 +358,7 @@ func (f *Fs) bqServe(ctx context.Context, bucketName, directory, prefix string, 
 	if err != nil {
 		return err
 	}
-	fs.Debugf(f, "BigQuery listing cache: served %d entries for %q from cache (recurse=%v)", found, directory, recurse)
+	fs.Infof(f, "BigQuery listing cache: served %d entries for %q from cache (recurse=%v)", found, directory, recurse)
 	// match the Cloud Storage list path: an empty result may mean a missing dir
 	if found == 0 {
 		return f.bqNotFound(ctx, bucketName, directory)

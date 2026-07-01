@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/rclone/rclone/fs"
 	bigquery "google.golang.org/api/bigquery/v2"
 	storage "google.golang.org/api/storage/v1"
 )
@@ -138,6 +139,7 @@ func (f *Fs) bqQueryRows(ctx context.Context, bucketName, directory string, recu
 	if !recurse || directory != f.bqRemoteRoot() {
 		return fmt.Errorf("googlecloudstorage: internal error: a BigQuery listing query must be a root recursive populate, got directory=%q recurse=%v", directory, recurse)
 	}
+	fs.Infof(f, "BigQuery listing cache: running BigQuery query to populate %q (dir=%q, recurse=%v)", bucketName, directory, recurse)
 	sql, params := f.bqListQuery(bucketName, directory, recurse)
 	useLegacy := false
 	req := &bigquery.QueryRequest{
