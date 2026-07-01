@@ -41,6 +41,7 @@ import (
 	"github.com/rclone/rclone/lib/env"
 	"github.com/rclone/rclone/lib/oauthutil"
 	"github.com/rclone/rclone/lib/pacer"
+	bolt "go.etcd.io/bbolt"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
 	bigquery "google.golang.org/api/bigquery/v2"
@@ -391,13 +392,12 @@ endpoint configuration.`,
 			Advanced: true,
 			Help: `BigQuery table holding a GCS Storage Insights inventory report.
 
-If set, object listings (both single-level and recursive) are served by querying
-this table instead of the Cloud Storage list API - useful for very large buckets.
-Give a fully-qualified ` + "`project.dataset.table`" + ` (or ` + "`dataset.table`" + ` with
-bigquery_billing_project set). The table must have columns: bucket, name, size,
-md5Hash, updated, snapshotTime. Each query pins to the latest snapshotTime per
-bucket, so listings reflect the most recent inventory report (which lags live
-bucket state). Object downloads still go through Cloud Storage.
+If set, object listings are served from a local bbolt cache populated from this
+table instead of the Cloud Storage list API - useful for very large buckets. This
+requires bigquery_cache_db to be set. Give a fully-qualified ` + "`project.dataset.table`" + `
+(or ` + "`dataset.table`" + ` with bigquery_billing_project set). The table must have
+columns: bucket, name, size, md5Hash, updated. Object downloads still go through
+Cloud Storage.
 
 This needs a BigQuery read scope in addition to the storage scope; with oauth
 (not service account/env auth) you must reconnect to re-consent.`,
@@ -408,6 +408,30 @@ This needs a BigQuery read scope in addition to the storage scope; with oauth
 
 Leave blank to infer it from a fully-qualified bigquery_table, or from the
 service account credentials' project_id.`,
+		}, {
+			Name:     "bigquery_cache_db",
+			Advanced: true,
+			Help: `Local bbolt file caching bigquery_table listings (required with bigquery_table).
+
+Required whenever bigquery_table is set. Point it at a writable local file path -
+e.g. /var/lib/rclone/gcs-cache.bolt. A recursive list at the remote root (such as
+"rclone rc vfs/refresh recursive=true", or automatically once the cache ages past
+bigquery_cache_max_age) repopulates the whole cache in one BigQuery query, and
+every other list is then served from the file with no BigQuery traffic.
+
+Must be a local path owned by a single rclone process (bbolt takes an exclusive
+lock and memory-maps the file) - never share it between multiple machines.`,
+		}, {
+			Name:     "bigquery_cache_max_age",
+			Advanced: true,
+			Default:  fs.Duration(48 * time.Hour),
+			Help: `How stale a bigquery_cache_db entry may be before a list repopulates it.
+
+A list served from a cache older than this first triggers one full repopulate
+(still a single BigQuery query, never one-per-directory). This drives periodic
+refresh on its own when nothing external refreshes the cache, and acts as a
+safety net when something does. Set to 0 to serve from the cache no matter how
+old it is.`,
 		}}...),
 	})
 }
@@ -433,6 +457,8 @@ type Options struct {
 	AccessToken               string               `config:"access_token"`
 	BigQueryTable             string               `config:"bigquery_table"`
 	BigQueryBillingProject    string               `config:"bigquery_billing_project"`
+	BigQueryCacheDB           string               `config:"bigquery_cache_db"`
+	BigQueryCacheMaxAge       fs.Duration          `config:"bigquery_cache_max_age"`
 }
 
 // Fs represents a remote storage server
@@ -450,6 +476,16 @@ type Fs struct {
 	warnCompressed sync.Once         // warn once about compressed files
 	bqSvc          *bigquery.Service // BigQuery client, non-nil only when listing from bigquery_table
 	bqProject      string            // project that runs/bills the inventory query
+	bqDB           *bolt.DB          // bbolt listing cache, non-nil only when bigquery_cache_db is set
+	bqPopMu        sync.Mutex        // serialises cache (re)populates so a herd of reads triggers one query
+	bqLastPopFail  time.Time         // last failed populate; bounds retries during an outage, guarded by bqPopMu
+	// bqQuery is the sole entry to a BigQuery listing query and the gate for the
+	// whole BigQuery path (non-nil iff bigquery_table is set). It defaults to
+	// bqQueryRows; tests swap in a fake to count and fake BigQuery calls.
+	bqQuery func(ctx context.Context, bucketName, directory string, recurse bool, fn func(bqRow) error) error
+	// bqNotFound reproduces the Storage list path's fs.ErrorDirNotFound; defaults
+	// to bqVerifyNotFound, swappable in tests so they need no Storage client.
+	bqNotFound func(ctx context.Context, bucketName, directory string) error
 }
 
 // Object describes a storage object
@@ -557,6 +593,14 @@ func (f *Fs) setRoot(root string) {
 	f.rootBucket, f.rootDirectory = bucket.Split(f.root)
 }
 
+// Shutdown closes the bigquery_cache_db bbolt handle if one is open.
+func (f *Fs) Shutdown(ctx context.Context) error {
+	if f.bqDB != nil {
+		return f.bqDB.Close()
+	}
+	return nil
+}
+
 // NewFs constructs an Fs from the path, bucket:path
 func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, error) {
 	var oAuthClient *http.Client
@@ -572,6 +616,9 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	}
 	if opt.BucketACL == "" {
 		opt.BucketACL = "private"
+	}
+	if opt.BigQueryTable != "" && opt.BigQueryCacheDB == "" {
+		return nil, errors.New("bigquery_table requires bigquery_cache_db to be set (a local bbolt cache path)")
 	}
 
 	// try loading service account credentials from env variable, then from a file
@@ -666,6 +713,12 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		f.bqSvc, err = bigquery.NewService(ctx, option.WithHTTPClient(f.client))
 		if err != nil {
 			return nil, fmt.Errorf("couldn't create BigQuery client: %w", err)
+		}
+		f.bqQuery = f.bqQueryRows // real BigQuery query; also gates the BigQuery path
+		f.bqNotFound = f.bqVerifyNotFound
+		f.bqDB, err = openBQCache(opt.BigQueryCacheDB) // required with bigquery_table (checked above)
+		if err != nil {
+			return nil, err
 		}
 	}
 
@@ -762,7 +815,7 @@ func (f *Fs) list(ctx context.Context, bucket, directory, prefix string, addBuck
 	if directory != "" {
 		directory += "/"
 	}
-	if f.bqSvc != nil {
+	if f.bqQuery != nil {
 		return f.listBQ(ctx, bucket, directory, prefix, addBucket, recurse, fn)
 	}
 	list := f.svc.Objects.List(bucket).Prefix(directory).MaxResults(listChunks)

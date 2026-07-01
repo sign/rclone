@@ -36,7 +36,7 @@ func TestBQListQuery(t *testing.T) {
 	f.opt.BigQueryTable = "proj.ds.tbl"
 
 	rec, params := f.bqListQuery("buck", "photos/", true)
-	for _, want := range []string{"FROM `proj.ds.tbl`", "STARTS_WITH(name, @dir)", "MAX(snapshotTime)", "TO_BASE64(FROM_HEX(md5Hash))"} {
+	for _, want := range []string{"FROM `proj.ds.tbl`", "STARTS_WITH(name, @dir)", "TO_BASE64(FROM_HEX(md5Hash))"} {
 		if !strings.Contains(rec, want) {
 			t.Errorf("recursive query missing %q:\n%s", want, rec)
 		}
@@ -46,7 +46,7 @@ func TestBQListQuery(t *testing.T) {
 	}
 
 	single, _ := f.bqListQuery("buck", "", false)
-	for _, want := range []string{"UNION DISTINCT", "REGEXP_EXTRACT(rel, r'^[^/]+/')", "STRPOS(rel, '/') = 0", "MAX(snapshotTime)"} {
+	for _, want := range []string{"UNION DISTINCT", "REGEXP_EXTRACT(rel, r'^[^/]+/')", "STRPOS(rel, '/') = 0"} {
 		if !strings.Contains(single, want) {
 			t.Errorf("single-level query missing %q:\n%s", want, single)
 		}

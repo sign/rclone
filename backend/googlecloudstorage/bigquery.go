@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/rclone/rclone/fs"
 	bigquery "google.golang.org/api/bigquery/v2"
 	storage "google.golang.org/api/storage/v1"
 )
@@ -70,11 +71,10 @@ func bqParam(name, value string) *bigquery.QueryParameter {
 
 // bqListQuery builds the GoogleSQL listing query and its named parameters.
 //
-// Every query pins to the latest snapshotTime for the bucket, so listings reflect
-// the most recent inventory report. updated is formatted to RFC3339Nano so it drops
-// straight into storage.Object.Updated; md5Hash is converted from the inventory's
-// hex to base64 so both are parsed by setMetaData unchanged (it base64-decodes the
-// hash and RFC3339-parses the time).
+// updated is formatted to RFC3339Nano so it drops straight into
+// storage.Object.Updated; md5Hash is converted from the inventory's hex to base64
+// so both are parsed by setMetaData unchanged (it base64-decodes the hash and
+// RFC3339-parses the time).
 //
 // Recursive lists every object under @dir. Single-level returns objects directly in
 // @dir plus a synthesized row per immediate sub-directory (name ending in "/", which
@@ -85,25 +85,24 @@ func (f *Fs) bqListQuery(bucketName, directory string, recurse bool) (string, []
 	params := []*bigquery.QueryParameter{bqParam("bucket", bucketName), bqParam("dir", directory)}
 	const ts = "FORMAT_TIMESTAMP('%Y-%m-%dT%H:%M:%E*SZ', updated)"
 	const md5 = "TO_BASE64(FROM_HEX(md5Hash))" // Storage Insights stores md5Hash as hex; setMetaData wants base64
-	latest := fmt.Sprintf("snapshotTime = (SELECT MAX(snapshotTime) FROM `%s` WHERE bucket = @bucket)", tbl)
 
 	if recurse {
 		sql := fmt.Sprintf(
 			"SELECT name, size, %s AS md5Hash, %s AS updated "+
-				"FROM `%s` WHERE bucket = @bucket AND STARTS_WITH(name, @dir) AND %s",
-			md5, ts, tbl, latest)
+				"FROM `%s` WHERE bucket = @bucket AND STARTS_WITH(name, @dir)",
+			md5, ts, tbl)
 		return sql, params
 	}
 
 	sql := fmt.Sprintf(
 		"WITH objs AS ("+
 			"SELECT name, size, %s AS md5Hash, %s AS updated, SUBSTR(name, LENGTH(@dir)+1) AS rel "+
-			"FROM `%s` WHERE bucket = @bucket AND STARTS_WITH(name, @dir) AND %s) "+
+			"FROM `%s` WHERE bucket = @bucket AND STARTS_WITH(name, @dir)) "+
 			"SELECT name, size, md5Hash, updated FROM objs WHERE STRPOS(rel, '/') = 0 "+
 			"UNION DISTINCT "+
 			"SELECT CONCAT(@dir, REGEXP_EXTRACT(rel, r'^[^/]+/')), CAST(0 AS INT64), CAST(NULL AS STRING), CAST(NULL AS STRING) "+
 			"FROM objs WHERE STRPOS(rel, '/') > 0",
-		md5, ts, tbl, latest)
+		md5, ts, tbl)
 	return sql, params
 }
 
@@ -119,9 +118,28 @@ func cellString(cell *bigquery.TableCell) string {
 	return fmt.Sprint(cell.V)
 }
 
-// listBQ serves list() from the BigQuery inventory table, emitting the same
-// (remote, *storage.Object, isDirectory) triples the listFn callback expects.
-func (f *Fs) listBQ(ctx context.Context, bucketName, directory, prefix string, addBucket, recurse bool, fn listFn) error {
+// bqRow is one inventory row as returned by BigQuery: raw cell strings, before
+// any path mapping. size/md5/updated are unused (and typically empty) for
+// directory-marker rows.
+type bqRow struct {
+	name    string
+	size    string
+	md5     string
+	updated string
+}
+
+// bqQueryRows runs the listing query for (bucketName, directory) and invokes fn
+// for each row. It is the BigQuery half of listing, driven by the cache populate
+// in bqcache.go.
+func (f *Fs) bqQueryRows(ctx context.Context, bucketName, directory string, recurse bool, fn func(bqRow) error) error {
+	// Money guard: this is the only function that spends BigQuery, and the sole
+	// legitimate query is a root-level recursive populate (bigquery_table always
+	// runs with the cache). A per-directory query here would reopen the storm the
+	// cache exists to prevent, so refuse it rather than execute it.
+	if !recurse || directory != f.bqRemoteRoot() {
+		return fmt.Errorf("googlecloudstorage: internal error: a BigQuery listing query must be a root recursive populate, got directory=%q recurse=%v", directory, recurse)
+	}
+	fs.Infof(f, "BigQuery listing cache: running BigQuery query to populate %q (dir=%q, recurse=%v)", bucketName, directory, recurse)
 	sql, params := f.bqListQuery(bucketName, directory, recurse)
 	useLegacy := false
 	req := &bigquery.QueryRequest{
@@ -138,7 +156,6 @@ func (f *Fs) listBQ(ctx context.Context, bucketName, directory, prefix string, a
 		rows      []*bigquery.TableRow
 		pageToken string
 		started   bool
-		found     int
 	)
 	for {
 		if !started {
@@ -185,30 +202,40 @@ func (f *Fs) listBQ(ctx context.Context, bucketName, directory, prefix string, a
 			if name == "" {
 				continue
 			}
-			remote, isDirectory, skip := f.objectRemote(name, directory, prefix, bucketName, addBucket)
-			if skip {
-				continue
-			}
-			object := &storage.Object{Name: name}
-			if !isDirectory {
-				object.Size, _ = strconv.ParseUint(cellString(row.F[1]), 10, 64)
-				object.Md5Hash = cellString(row.F[2]) // base64 (converted from the inventory's hex in SQL), as setMetaData expects
-				object.Updated = cellString(row.F[3])
-			}
-			if err := fn(remote, object, isDirectory); err != nil {
+			if err := fn(bqRow{
+				name:    name,
+				size:    cellString(row.F[1]),
+				md5:     cellString(row.F[2]),
+				updated: cellString(row.F[3]),
+			}); err != nil {
 				return err
 			}
-			found++
 		}
 
 		if pageToken == "" {
 			break
 		}
 	}
-	// BigQuery returns zero rows for a missing bucket/directory the same as for an
-	// empty one, so reproduce the Cloud Storage list path's fs.ErrorDirNotFound.
-	if found == 0 {
-		return f.bqVerifyNotFound(ctx, bucketName, directory)
-	}
 	return nil
+}
+
+// emitBQRow maps one raw inventory row through objectRemote/setMetaData exactly
+// as the Cloud Storage list path does, and feeds the listFn callback. It reports
+// whether a row was emitted (skipped rows don't count towards the
+// directory-not-found check). Shared by the direct and cache-served paths.
+func (f *Fs) emitBQRow(r bqRow, directory, prefix, bucketName string, addBucket bool, fn listFn) (emitted bool, err error) {
+	remote, isDirectory, skip := f.objectRemote(r.name, directory, prefix, bucketName, addBucket)
+	if skip {
+		return false, nil
+	}
+	object := &storage.Object{Name: r.name}
+	if !isDirectory {
+		object.Size, _ = strconv.ParseUint(r.size, 10, 64)
+		object.Md5Hash = r.md5 // base64 (converted from the inventory's hex in SQL), as setMetaData expects
+		object.Updated = r.updated
+	}
+	if err := fn(remote, object, isDirectory); err != nil {
+		return false, err
+	}
+	return true, nil
 }
