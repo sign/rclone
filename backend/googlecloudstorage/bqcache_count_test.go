@@ -402,6 +402,27 @@ func randomFixture(rng *rand.Rand) []bqRow {
 	return rows
 }
 
+// 15. the exact stale-subdir scenario: warm (like --vfs-refresh) → bbolt goes
+// stale → a single-level `ls` of a SUBDIR fires one repopulate whose query is at
+// the ROOT (@dir=""), never the subdir.
+func TestBQCacheCountStaleSubdirRepopulatesFromRoot(t *testing.T) {
+	f, rec := newCountFs(t, countFixture, true)
+	if err := walkDir(f, "", true); err != nil { // warm via recursive root: 1 query
+		t.Fatal(err)
+	}
+	ageCache(t, f, "buck")                              // bbolt now older than max_age
+	if err := walkDir(f, "d1/sub", false); err != nil { // single-level ls of a subdir
+		t.Fatalf("ls d1/sub: %v", err)
+	}
+	calls := rec.snapshot()
+	if len(calls) != 2 {
+		t.Fatalf("fired %d queries, want 2 (1 warm + 1 stale repopulate)", len(calls))
+	}
+	if calls[1].directory != "" || !calls[1].recurse {
+		t.Errorf("stale repopulate query was directory=%q recurse=%v; want root recursive (@dir=\"\")", calls[1].directory, calls[1].recurse)
+	}
+}
+
 // 13. a failed BigQuery populate must not flip the generation or corrupt the
 // cache: the error propagates, the cache stays cold, and a later populate
 // recovers. (Guards against a transient BigQuery failure leaving a half-written
