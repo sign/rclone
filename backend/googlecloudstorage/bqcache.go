@@ -146,25 +146,13 @@ func (f *Fs) bqCacheStale(bucketName string) (bool, error) {
 	return stale, err
 }
 
-// queryBigQuery is the single entry point to a BigQuery listing query. It is the
-// structural guard against the per-directory query storm: with the cache enabled
-// the only legitimate query is a root-level recursive populate, so anything else
-// is refused loudly rather than executed. Without the cache (direct path) a
-// per-directory single-level query is by design, so the guard doesn't apply.
-func (f *Fs) queryBigQuery(ctx context.Context, bucketName, directory string, recurse bool, fn func(bqRow) error) error {
-	if f.bqDB != nil && (!recurse || directory != f.bqRemoteRoot()) {
-		return fmt.Errorf("googlecloudstorage: internal error: a cache-backed BigQuery query must be a root recursive populate, got directory=%q recurse=%v", directory, recurse)
-	}
-	return f.bqQuery(ctx, bucketName, directory, recurse, fn)
-}
-
 // cacheRootSource is the only origin of cache-backed BigQuery queries: one
-// recursive query over the remote root. Routing every populate through here (and
-// thus through queryBigQuery) is what makes a per-directory query from the
-// cache-on path impossible by construction.
+// recursive query over the remote root. bqQueryRows itself refuses any
+// cache-backed query that is not exactly this (root, recursive), so a
+// per-directory query from the cache-on path is impossible by construction.
 func (f *Fs) cacheRootSource(ctx context.Context, bucketName string) bqRowSource {
 	return func(emit func(bqRow) error) error {
-		return f.queryBigQuery(ctx, bucketName, f.bqRemoteRoot(), true, emit)
+		return f.bqQuery(ctx, bucketName, f.bqRemoteRoot(), true, emit)
 	}
 }
 

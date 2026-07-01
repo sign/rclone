@@ -131,6 +131,14 @@ type bqRow struct {
 // for each row. It is the BigQuery half of listing, shared by the direct
 // (cache-disabled) path and by the cache populate in bqcache.go.
 func (f *Fs) bqQueryRows(ctx context.Context, bucketName, directory string, recurse bool, fn func(bqRow) error) error {
+	// Money guard: this is the only function that spends BigQuery. With the cache
+	// enabled the sole legitimate query is a root-level recursive populate; a
+	// per-directory query here would reopen the storm the cache exists to prevent,
+	// so refuse it rather than execute it. Without the cache, per-directory
+	// single-level queries are the intended behaviour, so the guard doesn't apply.
+	if f.bqDB != nil && (!recurse || directory != f.bqRemoteRoot()) {
+		return fmt.Errorf("googlecloudstorage: internal error: a cache-backed BigQuery query must be a root recursive populate, got directory=%q recurse=%v", directory, recurse)
+	}
 	sql, params := f.bqListQuery(bucketName, directory, recurse)
 	useLegacy := false
 	req := &bigquery.QueryRequest{
@@ -245,7 +253,7 @@ func (f *Fs) listBQ(ctx context.Context, bucketName, directory, prefix string, a
 // behaviour, used when bigquery_cache_db is not set.
 func (f *Fs) listBQDirect(ctx context.Context, bucketName, directory, prefix string, addBucket, recurse bool, fn listFn) error {
 	found := 0
-	err := f.queryBigQuery(ctx, bucketName, directory, recurse, func(r bqRow) error {
+	err := f.bqQuery(ctx, bucketName, directory, recurse, func(r bqRow) error {
 		emitted, err := f.emitBQRow(r, directory, prefix, bucketName, addBucket, fn)
 		if emitted {
 			found++

@@ -276,19 +276,18 @@ func TestBQCacheCountCacheOffStorms(t *testing.T) {
 	}
 }
 
-// 8 (mechanism): the structural guard refuses a cache-backed non-root query and
-// allows a root recursive one.
-func TestBQCacheGuardRejectsNonRootQuery(t *testing.T) {
-	f, _ := newCountFs(t, countFixture, true)
+// 8 (mechanism): bqQueryRows - the only function that spends BigQuery - refuses a
+// cache-backed query that isn't a root recursive populate, before touching the
+// BigQuery client. (The allow path, root recursive, would proceed to the real
+// client; it's exercised by the count tests via the injected fake.)
+func TestBQQueryRowsGuardRejectsNonRoot(t *testing.T) {
+	f, _ := newCountFs(t, countFixture, true) // cache on (f.bqDB set)
 	noop := func(bqRow) error { return nil }
-	if err := f.queryBigQuery(context.Background(), "buck", "d1/", false, noop); err == nil {
-		t.Error("guard allowed a cache-backed per-directory query; want error")
+	if err := f.bqQueryRows(context.Background(), "buck", "d1/", false, noop); err == nil {
+		t.Error("bqQueryRows ran a cache-backed per-directory query; want error")
 	}
-	if err := f.queryBigQuery(context.Background(), "buck", "d1/", true, noop); err == nil {
-		t.Error("guard allowed a cache-backed recursive subtree query; want error")
-	}
-	if err := f.queryBigQuery(context.Background(), "buck", "", true, noop); err != nil {
-		t.Errorf("guard rejected the legitimate root recursive query: %v", err)
+	if err := f.bqQueryRows(context.Background(), "buck", "d1/", true, noop); err == nil {
+		t.Error("bqQueryRows ran a cache-backed recursive subtree query; want error")
 	}
 }
 
