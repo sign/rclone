@@ -156,11 +156,12 @@ func (f *Fs) cacheRootSource(ctx context.Context, bucketName string) bqRowSource
 	}
 }
 
-// listBQCached serves a list from the bbolt cache. A recursive list at the
-// remote root is the populate (unconditional - this is the scheduled refresh);
-// every other list serves from bbolt, triggering one full-root populate first if
-// the cache is cold or stale. Nothing here ever issues a per-directory query.
-func (f *Fs) listBQCached(ctx context.Context, bucketName, directory, prefix string, addBucket, recurse bool, fn listFn) error {
+// listBQ serves a list from the bbolt cache (bigquery_table always runs with the
+// cache). A recursive list at the remote root is the populate (unconditional -
+// this is the scheduled/boot refresh); every other list serves from bbolt,
+// triggering one full-root populate first if the cache is cold or stale. Nothing
+// here ever issues a per-directory query.
+func (f *Fs) listBQ(ctx context.Context, bucketName, directory, prefix string, addBucket, recurse bool, fn listFn) error {
 	if recurse && directory == f.bqRemoteRoot() {
 		f.bqPopMu.Lock()
 		defer f.bqPopMu.Unlock()

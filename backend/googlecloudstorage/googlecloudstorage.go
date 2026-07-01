@@ -392,11 +392,12 @@ endpoint configuration.`,
 			Advanced: true,
 			Help: `BigQuery table holding a GCS Storage Insights inventory report.
 
-If set, object listings (both single-level and recursive) are served by querying
-this table instead of the Cloud Storage list API - useful for very large buckets.
-Give a fully-qualified ` + "`project.dataset.table`" + ` (or ` + "`dataset.table`" + ` with
-bigquery_billing_project set). The table must have columns: bucket, name, size,
-md5Hash, updated. Object downloads still go through Cloud Storage.
+If set, object listings are served from a local bbolt cache populated from this
+table instead of the Cloud Storage list API - useful for very large buckets. This
+requires bigquery_cache_db to be set. Give a fully-qualified ` + "`project.dataset.table`" + `
+(or ` + "`dataset.table`" + ` with bigquery_billing_project set). The table must have
+columns: bucket, name, size, md5Hash, updated. Object downloads still go through
+Cloud Storage.
 
 This needs a BigQuery read scope in addition to the storage scope; with oauth
 (not service account/env auth) you must reconnect to re-consent.`,
@@ -410,15 +411,13 @@ service account credentials' project_id.`,
 		}, {
 			Name:     "bigquery_cache_db",
 			Advanced: true,
-			Help: `Local bbolt file caching bigquery_table listings (default off).
+			Help: `Local bbolt file caching bigquery_table listings (required with bigquery_table).
 
-Only used together with bigquery_table. Leave blank to query BigQuery on every
-list (the default). Set it to a writable local file path - e.g.
-/var/lib/rclone/gcs-cache.bolt - to cache listings there: a recursive list at
-the remote root (such as "rclone rc vfs/refresh recursive=true", or automatically
-once the cache ages past bigquery_cache_max_age) repopulates the whole cache in
-one BigQuery query, and every other list is then served from the file with no
-BigQuery traffic.
+Required whenever bigquery_table is set. Point it at a writable local file path -
+e.g. /var/lib/rclone/gcs-cache.bolt. A recursive list at the remote root (such as
+"rclone rc vfs/refresh recursive=true", or automatically once the cache ages past
+bigquery_cache_max_age) repopulates the whole cache in one BigQuery query, and
+every other list is then served from the file with no BigQuery traffic.
 
 Must be a local path owned by a single rclone process (bbolt takes an exclusive
 lock and memory-maps the file) - never share it between multiple machines.`,
@@ -617,6 +616,9 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	if opt.BucketACL == "" {
 		opt.BucketACL = "private"
 	}
+	if opt.BigQueryTable != "" && opt.BigQueryCacheDB == "" {
+		return nil, errors.New("bigquery_table requires bigquery_cache_db to be set (a local bbolt cache path)")
+	}
 
 	// try loading service account credentials from env variable, then from a file
 	if opt.ServiceAccountCredentials == "" && opt.ServiceAccountFile != "" {
@@ -713,11 +715,9 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		}
 		f.bqQuery = f.bqQueryRows // real BigQuery query; also gates the BigQuery path
 		f.bqNotFound = f.bqVerifyNotFound
-		if opt.BigQueryCacheDB != "" {
-			f.bqDB, err = openBQCache(opt.BigQueryCacheDB)
-			if err != nil {
-				return nil, err
-			}
+		f.bqDB, err = openBQCache(opt.BigQueryCacheDB) // required with bigquery_table (checked above)
+		if err != nil {
+			return nil, err
 		}
 	}
 

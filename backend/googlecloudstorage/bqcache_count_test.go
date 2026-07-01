@@ -9,9 +9,11 @@ package googlecloudstorage
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math/rand"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 	"sync"
@@ -22,6 +24,7 @@ import (
 	storage "google.golang.org/api/storage/v1"
 
 	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/config/configmap"
 )
 
 // queryCall records what a fired BigQuery query targeted.
@@ -37,6 +40,7 @@ type queryRecorder struct {
 	mu      sync.Mutex
 	fixture []bqRow
 	calls   []queryCall
+	err     error // if set, query returns this instead of serving rows
 
 	gate    bool
 	started chan struct{}
@@ -47,10 +51,14 @@ func (r *queryRecorder) query(ctx context.Context, bucketName, directory string,
 	r.mu.Lock()
 	r.calls = append(r.calls, queryCall{directory: directory, recurse: recurse})
 	gate := r.gate
+	qerr := r.err
 	r.mu.Unlock()
 	if gate {
 		r.started <- struct{}{}
 		<-r.release
+	}
+	if qerr != nil {
+		return qerr
 	}
 	// mimic the inventory query's STARTS_WITH(name, @dir)
 	for _, row := range r.fixture {
@@ -263,31 +271,46 @@ func TestBQCacheCountMissingDirNoPopulate(t *testing.T) {
 	}
 }
 
-// 7. contrast: cache OFF + walk every directory => one query PER directory. This
-// is the original storming behaviour, and proves the cache is what prevents it.
-func TestBQCacheCountCacheOffStorms(t *testing.T) {
-	f, rec := newCountFs(t, countFixture, false)
-	dirs := fixtureDirs(countFixture)
-	for _, d := range dirs {
-		_ = walkDir(f, d, false)
-	}
-	if n := rec.count(); n != len(dirs) {
-		t.Errorf("cache off: walked %d dirs, fired %d queries; want %d (one per dir)", len(dirs), n, len(dirs))
+// 7. The cache is now mandatory: NewFs refuses bigquery_table without
+// bigquery_cache_db (so the storming uncached path can't even be configured), and
+// the check must not fire for configs that don't use bigquery_table.
+func TestNewFsRequiresCacheDB(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		cfg          configmap.Simple
+		wantCacheErr bool
+	}{
+		{name: "table without cache_db", cfg: configmap.Simple{"bigquery_table": "proj.ds.tbl"}, wantCacheErr: true},
+		{name: "no bigquery_table", cfg: configmap.Simple{"anonymous": "true"}, wantCacheErr: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := NewFs(context.Background(), "gcs", "bucket", tc.cfg)
+			// robust either way: for the negative case we only require that the
+			// error (if any, from later setup) is not the cache-db one.
+			gotCacheErr := err != nil && strings.Contains(err.Error(), "bigquery_cache_db")
+			if gotCacheErr != tc.wantCacheErr {
+				t.Errorf("NewFs(%v): cache-db error = %v (err=%v); want %v", tc.cfg, gotCacheErr, err, tc.wantCacheErr)
+			}
+		})
 	}
 }
 
-// 8 (mechanism): bqQueryRows - the only function that spends BigQuery - refuses a
-// cache-backed query that isn't a root recursive populate, before touching the
-// BigQuery client. (The allow path, root recursive, would proceed to the real
-// client; it's exercised by the count tests via the injected fake.)
+// 8 (mechanism): bqQueryRows - the only function that spends BigQuery - refuses
+// any query that isn't a root recursive populate, before touching the BigQuery
+// client. The guard is unconditional (bigquery_table always runs with the cache),
+// so it fires whether or not the bbolt handle is present. (The allow path, root
+// recursive, would proceed to the real client; the count tests exercise it via
+// the injected fake.)
 func TestBQQueryRowsGuardRejectsNonRoot(t *testing.T) {
-	f, _ := newCountFs(t, countFixture, true) // cache on (f.bqDB set)
 	noop := func(bqRow) error { return nil }
-	if err := f.bqQueryRows(context.Background(), "buck", "d1/", false, noop); err == nil {
-		t.Error("bqQueryRows ran a cache-backed per-directory query; want error")
-	}
-	if err := f.bqQueryRows(context.Background(), "buck", "d1/", true, noop); err == nil {
-		t.Error("bqQueryRows ran a cache-backed recursive subtree query; want error")
+	for _, cacheOn := range []bool{true, false} {
+		f, _ := newCountFs(t, countFixture, cacheOn)
+		if err := f.bqQueryRows(context.Background(), "buck", "d1/", false, noop); err == nil {
+			t.Errorf("cacheOn=%v: bqQueryRows ran a per-directory query; want error", cacheOn)
+		}
+		if err := f.bqQueryRows(context.Background(), "buck", "d1/", true, noop); err == nil {
+			t.Errorf("cacheOn=%v: bqQueryRows ran a recursive subtree query; want error", cacheOn)
+		}
 	}
 }
 
@@ -377,4 +400,67 @@ func randomFixture(rng *rand.Rand) []bqRow {
 		rows = append(rows, bqRow{name: name, size: "1"})
 	}
 	return rows
+}
+
+// 13. a failed BigQuery populate must not flip the generation or corrupt the
+// cache: the error propagates, the cache stays cold, and a later populate
+// recovers. (Guards against a transient BigQuery failure leaving a half-written
+// or wrongly-current snapshot.)
+func TestBQCachePopulateErrorDoesNotFlip(t *testing.T) {
+	f, rec := newCountFs(t, countFixture, true)
+	rec.err = errors.New("boom")
+	if err := walkDir(f, "", true); err == nil {
+		t.Fatal("populate error was not propagated")
+	}
+	if gen := readGen(t, f, "buck"); gen != 0 {
+		t.Errorf("failed populate left generation %d; want 0 (no flip)", gen)
+	}
+
+	// recovery: query succeeds, cache populates and flips normally
+	rec.err = nil
+	if err := walkDir(f, "", true); err != nil {
+		t.Fatalf("recovery populate: %v", err)
+	}
+	if gen := readGen(t, f, "buck"); gen != 1 {
+		t.Errorf("generation after recovery = %d; want 1", gen)
+	}
+	if got := collect(t, f, "buck", "", true); len(got) == 0 {
+		t.Error("recovered cache served nothing")
+	}
+}
+
+// 14. generation-swap is atomic under concurrent reads: while a populate is
+// mid-flight writing the next generation, a concurrent read sees the complete
+// previous snapshot (never partial/empty), and the new one only after the swap.
+// Run under -race.
+func TestBQCacheGenerationSwapAtomicUnderConcurrentReads(t *testing.T) {
+	f, rec := newCountFs(t, []bqRow{{name: "old.txt", size: "1"}}, true)
+	if err := walkDir(f, "", true); err != nil { // populate gen 1 (old.txt)
+		t.Fatal(err)
+	}
+
+	// the next populate produces gen 2 (new.txt); gate it so it blocks mid-query
+	// with gen 1 still current. Set before launching the goroutine (happens-before).
+	rec.fixture = []bqRow{{name: "new.txt", size: "1"}}
+	rec.gate = true
+	rec.started = make(chan struct{}, 1)
+	rec.release = make(chan struct{})
+
+	done := make(chan struct{})
+	go func() {
+		_ = walkDir(f, "", true) // recursive root => populate gen 2, blocks in the query
+		close(done)
+	}()
+	<-rec.started // gen 2 is being written into its own bucket; gen 1 is still current
+
+	if got := collect(t, f, "buck", "", false); !reflect.DeepEqual(got, []string{"old.txt"}) {
+		t.Errorf("read during swap saw %v; want [old.txt] (complete previous snapshot)", got)
+	}
+
+	close(rec.release)
+	<-done
+
+	if got := collect(t, f, "buck", "", false); !reflect.DeepEqual(got, []string{"new.txt"}) {
+		t.Errorf("read after swap saw %v; want [new.txt]", got)
+	}
 }

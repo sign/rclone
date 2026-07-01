@@ -128,16 +128,15 @@ type bqRow struct {
 }
 
 // bqQueryRows runs the listing query for (bucketName, directory) and invokes fn
-// for each row. It is the BigQuery half of listing, shared by the direct
-// (cache-disabled) path and by the cache populate in bqcache.go.
+// for each row. It is the BigQuery half of listing, driven by the cache populate
+// in bqcache.go.
 func (f *Fs) bqQueryRows(ctx context.Context, bucketName, directory string, recurse bool, fn func(bqRow) error) error {
-	// Money guard: this is the only function that spends BigQuery. With the cache
-	// enabled the sole legitimate query is a root-level recursive populate; a
-	// per-directory query here would reopen the storm the cache exists to prevent,
-	// so refuse it rather than execute it. Without the cache, per-directory
-	// single-level queries are the intended behaviour, so the guard doesn't apply.
-	if f.bqDB != nil && (!recurse || directory != f.bqRemoteRoot()) {
-		return fmt.Errorf("googlecloudstorage: internal error: a cache-backed BigQuery query must be a root recursive populate, got directory=%q recurse=%v", directory, recurse)
+	// Money guard: this is the only function that spends BigQuery, and the sole
+	// legitimate query is a root-level recursive populate (bigquery_table always
+	// runs with the cache). A per-directory query here would reopen the storm the
+	// cache exists to prevent, so refuse it rather than execute it.
+	if !recurse || directory != f.bqRemoteRoot() {
+		return fmt.Errorf("googlecloudstorage: internal error: a BigQuery listing query must be a root recursive populate, got directory=%q recurse=%v", directory, recurse)
 	}
 	sql, params := f.bqListQuery(bucketName, directory, recurse)
 	useLegacy := false
@@ -237,36 +236,4 @@ func (f *Fs) emitBQRow(r bqRow, directory, prefix, bucketName string, addBucket 
 		return false, err
 	}
 	return true, nil
-}
-
-// listBQ serves list() from the BigQuery inventory table. Without a cache
-// (bqDB nil) it queries BigQuery on every call; with one it serves from bbolt,
-// querying BigQuery only to (re)populate - see bqcache.go.
-func (f *Fs) listBQ(ctx context.Context, bucketName, directory, prefix string, addBucket, recurse bool, fn listFn) error {
-	if f.bqDB == nil {
-		return f.listBQDirect(ctx, bucketName, directory, prefix, addBucket, recurse, fn)
-	}
-	return f.listBQCached(ctx, bucketName, directory, prefix, addBucket, recurse, fn)
-}
-
-// listBQDirect queries BigQuery and emits the rows - the original uncached
-// behaviour, used when bigquery_cache_db is not set.
-func (f *Fs) listBQDirect(ctx context.Context, bucketName, directory, prefix string, addBucket, recurse bool, fn listFn) error {
-	found := 0
-	err := f.bqQuery(ctx, bucketName, directory, recurse, func(r bqRow) error {
-		emitted, err := f.emitBQRow(r, directory, prefix, bucketName, addBucket, fn)
-		if emitted {
-			found++
-		}
-		return err
-	})
-	if err != nil {
-		return err
-	}
-	// BigQuery returns zero rows for a missing bucket/directory the same as for an
-	// empty one, so reproduce the Cloud Storage list path's fs.ErrorDirNotFound.
-	if found == 0 {
-		return f.bqNotFound(ctx, bucketName, directory)
-	}
-	return nil
 }
