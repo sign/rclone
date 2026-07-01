@@ -196,15 +196,29 @@ func (f *Fs) listBQ(ctx context.Context, bucketName, directory, prefix string, a
 			// bootstrap populates the whole remote root (fn nil = don't emit; we
 			// serve the requested slice from the fresh cache below)
 			err = f.bqPopulate(ctx, bucketName, f.bqRemoteRoot(), "", false, nil, f.cacheRootSource(ctx, bucketName))
+
+			// did the populate actually refresh? a zero-row query keeps the old
+			// (stale) snapshot without advancing the generation - like a failure, it
+			// leaves the cache stale, so it must back off too or every later list
+			// re-fires a full-root query during a transient empty/broken inventory.
+			var newGen uint64
+			_ = f.bqDB.View(func(tx *bolt.Tx) error {
+				newGen = bqReadGen(tx, bucketName)
+				return nil
+			})
 			switch {
-			case err == nil:
-				f.bqLastPopFail = time.Time{} // recovered
+			case err == nil && newGen != gen:
+				f.bqLastPopFail = time.Time{} // refreshed to a new generation
 			case gen != 0:
-				// a transient failure must not fail the list while we hold a (stale)
-				// snapshot; the on-disk timestamp is untouched, so the next list past
-				// the cooldown repopulates the moment BigQuery recovers
+				// failed, or returned zero rows: serve the stale snapshot and back
+				// off. The on-disk timestamp is untouched, so we repopulate the
+				// moment a real snapshot returns past the cooldown.
 				f.bqLastPopFail = time.Now()
-				fs.Logf(f, "BigQuery listing cache: repopulate failed for %q, serving stale cache: %v", bucketName, err)
+				if err != nil {
+					fs.Logf(f, "BigQuery listing cache: repopulate failed for %q, serving stale cache: %v", bucketName, err)
+				} else {
+					fs.Logf(f, "BigQuery listing cache: repopulate returned no rows for %q, serving stale cache", bucketName)
+				}
 				err = nil
 			}
 		}

@@ -543,6 +543,41 @@ func TestBQCacheCountStaleServesStaleOnPopulateFailure(t *testing.T) {
 	}
 }
 
+// 18 (Bugbot follow-up): a stale cache whose repopulate returns ZERO rows keeps
+// the stale snapshot but must NOT re-query on every later list — the empty result
+// engages the same cooldown as a failure, or a transient empty inventory recreates
+// the storm. (This fails on the naive "err == nil clears the cooldown" logic.)
+func TestBQCacheCountStaleEmptyRepopulateDoesNotLoop(t *testing.T) {
+	f, rec := newCountFs(t, countFixture, true)
+	if err := walkDir(f, "", true); err != nil { // warm: 1 query, gen 1
+		t.Fatal(err)
+	}
+	ageCache(t, f, "buck") // stale
+
+	// inventory transiently empty: the repopulate succeeds with zero rows and
+	// keeps gen 1 (a broken/regenerating inventory must not wipe a good cache).
+	rec.fixture = nil
+	if err := walkDir(f, "d1", false); err != nil {
+		t.Fatalf("stale list with empty repopulate: %v", err)
+	}
+	if n := rec.count(); n != 2 {
+		t.Fatalf("empty repopulate fired %d queries total, want 2 (warm + 1)", n)
+	}
+	if gen := readGen(t, f, "buck"); gen != 1 {
+		t.Errorf("empty repopulate changed generation to %d; want 1 (kept)", gen)
+	}
+
+	// subsequent stale lists within the cooldown must NOT re-query
+	for i := 0; i < 5; i++ {
+		if err := walkDir(f, "d2", false); err != nil {
+			t.Fatalf("stale list %d: %v", i, err)
+		}
+	}
+	if n := rec.count(); n != 2 {
+		t.Errorf("empty-inventory cooldown breached: %d queries, want 2 (no re-query loop)", n)
+	}
+}
+
 // 17 (Fix B): a recursive-root refresh whose query returns zero rows keeps the
 // existing cache AND still serves the caller its retained entries (not an
 // empty/not-found tree), leaving the generation unchanged.
