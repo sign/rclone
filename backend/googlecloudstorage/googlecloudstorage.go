@@ -478,6 +478,7 @@ type Fs struct {
 	bqProject      string            // project that runs/bills the inventory query
 	bqDB           *bolt.DB          // bbolt listing cache, non-nil only when bigquery_cache_db is set
 	bqPopMu        sync.Mutex        // serialises cache (re)populates so a herd of reads triggers one query
+	bqLastPopFail  time.Time         // last failed populate; bounds retries during an outage, guarded by bqPopMu
 	// bqQuery is the sole entry to a BigQuery listing query and the gate for the
 	// whole BigQuery path (non-nil iff bigquery_table is set). It defaults to
 	// bqQueryRows; tests swap in a fake to count and fake BigQuery calls.

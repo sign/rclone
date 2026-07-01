@@ -238,17 +238,23 @@ func TestBQCacheCountConcurrentColdHerd(t *testing.T) {
 	rec.release = make(chan struct{})
 
 	var wg sync.WaitGroup
+	var errs [M]error // per-index slots: disjoint writes, read after wg.Wait()
 	for i := 0; i < M; i++ {
 		wg.Add(1)
-		go func() {
+		go func(i int) {
 			defer wg.Done()
-			_ = walkDir(f, "d1", false)
-		}()
+			errs[i] = walkDir(f, "d1", false)
+		}(i)
 	}
 	<-rec.started      // one goroutine is inside the populate, holding bqPopMu
 	close(rec.release) // release it; the rest re-check and find the cache fresh
 	wg.Wait()
 
+	for i, err := range errs {
+		if err != nil {
+			t.Errorf("herd reader %d: %v", i, err)
+		}
+	}
 	if n := rec.count(); n != 1 {
 		t.Errorf("concurrent cold herd of %d readers fired %d queries, want 1", M, n)
 	}
@@ -380,7 +386,9 @@ func TestBQCacheCountRandomWarmInvariant(t *testing.T) {
 		if d == "" {
 			recurse = false // a recursive root read is the populate, not a "0 extra" case
 		}
-		_ = walkDir(f, d, recurse)
+		if err := walkDir(f, d, recurse); err != nil {
+			t.Fatalf("warm read dir=%q recurse=%v: %v", d, recurse, err)
+		}
 		if n := rec.count(); n != 1 {
 			t.Fatalf("warm cache fired %d queries after read %d (dir=%q recurse=%v); want 1", n, i, d, recurse)
 		}
@@ -468,8 +476,9 @@ func TestBQCacheGenerationSwapAtomicUnderConcurrentReads(t *testing.T) {
 	rec.release = make(chan struct{})
 
 	done := make(chan struct{})
+	var popErr error
 	go func() {
-		_ = walkDir(f, "", true) // recursive root => populate gen 2, blocks in the query
+		popErr = walkDir(f, "", true) // recursive root => populate gen 2, blocks in the query
 		close(done)
 	}()
 	<-rec.started // gen 2 is being written into its own bucket; gen 1 is still current
@@ -480,8 +489,84 @@ func TestBQCacheGenerationSwapAtomicUnderConcurrentReads(t *testing.T) {
 
 	close(rec.release)
 	<-done
+	if popErr != nil {
+		t.Fatalf("gen-2 populate: %v", popErr)
+	}
 
 	if got := collect(t, f, "buck", "", false); !reflect.DeepEqual(got, []string{"new.txt"}) {
 		t.Errorf("read after swap saw %v; want [new.txt]", got)
+	}
+}
+
+// 16 (Fix A): a stale cache whose repopulate FAILS serves the stale snapshot
+// instead of failing the list, does not re-hammer BigQuery on every list (the
+// cooldown), and repopulates once the query recovers. Contrast with test 13,
+// where a COLD cache + failure still propagates the error.
+func TestBQCacheCountStaleServesStaleOnPopulateFailure(t *testing.T) {
+	f, rec := newCountFs(t, countFixture, true)
+	if err := walkDir(f, "", true); err != nil { // warm: 1 query, gen 1
+		t.Fatal(err)
+	}
+	ageCache(t, f, "buck") // now stale
+
+	// repopulate fails, but a good (stale) snapshot is on disk: the list must
+	// still succeed by serving stale, firing exactly one (failed) attempt.
+	rec.err = errors.New("boom")
+	if err := walkDir(f, "d1", false); err != nil {
+		t.Fatalf("stale list with failing repopulate: got %v, want nil (served stale)", err)
+	}
+	if n := rec.count(); n != 2 {
+		t.Fatalf("first failed repopulate fired %d queries total, want 2 (warm + 1 attempt)", n)
+	}
+
+	// a second stale list within the cooldown serves stale WITHOUT re-querying
+	if err := walkDir(f, "d2", false); err != nil {
+		t.Fatalf("second stale list: %v", err)
+	}
+	if n := rec.count(); n != 2 {
+		t.Errorf("cooldown let another attempt through: %d queries, want 2", n)
+	}
+
+	// recovery: clear the cooldown (white-box), query succeeds, cache repopulates
+	f.bqPopMu.Lock()
+	f.bqLastPopFail = time.Time{}
+	f.bqPopMu.Unlock()
+	rec.err = nil
+	if err := walkDir(f, "d1", false); err != nil {
+		t.Fatalf("recovery list: %v", err)
+	}
+	if n := rec.count(); n != 3 {
+		t.Errorf("recovery fired %d queries total, want 3", n)
+	}
+	if gen := readGen(t, f, "buck"); gen != 2 {
+		t.Errorf("generation after recovery = %d; want 2 (repopulated)", gen)
+	}
+}
+
+// 17 (Fix B): a recursive-root refresh whose query returns zero rows keeps the
+// existing cache AND still serves the caller its retained entries (not an
+// empty/not-found tree), leaving the generation unchanged.
+func TestBQCacheEmptyRefreshServesRetainedCache(t *testing.T) {
+	f, rec := newCountFs(t, countFixture, true)
+	if err := walkDir(f, "", true); err != nil { // warm: gen 1
+		t.Fatal(err)
+	}
+
+	// the next recursive-root refresh returns nothing (inventory mid-regeneration)
+	rec.fixture = nil
+	var names []string
+	err := f.list(context.Background(), "buck", "", "", false, true,
+		func(remote string, _ *storage.Object, _ bool) error {
+			names = append(names, remote)
+			return nil
+		})
+	if err != nil {
+		t.Fatalf("empty refresh: got %v, want nil (served retained cache)", err)
+	}
+	if len(names) == 0 {
+		t.Error("empty refresh served no entries; want the retained snapshot")
+	}
+	if gen := readGen(t, f, "buck"); gen != 1 {
+		t.Errorf("empty refresh changed generation to %d; want 1 (kept)", gen)
 	}
 }
