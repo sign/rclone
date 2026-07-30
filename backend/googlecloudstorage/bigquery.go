@@ -13,6 +13,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/rclone/rclone/fs"
 	bigquery "google.golang.org/api/bigquery/v2"
@@ -139,6 +140,13 @@ func (f *Fs) bqQueryRows(ctx context.Context, bucketName, directory string, recu
 	if !recurse || directory != f.bqRemoteRoot() {
 		return fmt.Errorf("googlecloudstorage: internal error: a BigQuery listing query must be a root recursive populate, got directory=%q recurse=%v", directory, recurse)
 	}
+	// bound the whole populate (job + result pagination) so a slow query can't
+	// hold bqPopMu forever; the old snapshot keeps being served on timeout
+	if t := time.Duration(f.opt.BigQueryTimeout); t > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, t)
+		defer cancel()
+	}
 	fs.Infof(f, "BigQuery listing cache: running BigQuery query to populate %q (dir=%q, recurse=%v)", bucketName, directory, recurse)
 	sql, params := f.bqListQuery(bucketName, directory, recurse)
 	useLegacy := false
@@ -191,7 +199,14 @@ func (f *Fs) bqQueryRows(ctx context.Context, bucketName, directory string, recu
 		}
 
 		if !complete {
-			continue // job still running; poll again (the pacer paces this)
+			// job still running; the pacer only sleeps after retryable errors, so
+			// back off here instead of hammering getQueryResults in a tight loop
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(time.Second):
+			}
+			continue
 		}
 
 		for _, row := range rows {
@@ -219,6 +234,17 @@ func (f *Fs) bqQueryRows(ctx context.Context, bucketName, directory string, recu
 	return nil
 }
 
+// bqRowObject builds the storage.Object a cached inventory row stands for, in
+// the exact shape setMetaData expects. Shared by listing emission and the
+// NewObject point lookup.
+func bqRowObject(r bqRow) *storage.Object {
+	object := &storage.Object{Name: r.name}
+	object.Size, _ = strconv.ParseUint(r.size, 10, 64)
+	object.Md5Hash = r.md5 // base64 (converted from the inventory's hex in SQL), as setMetaData expects
+	object.Updated = r.updated
+	return object
+}
+
 // emitBQRow maps one raw inventory row through objectRemote/setMetaData exactly
 // as the Cloud Storage list path does, and feeds the listFn callback. It reports
 // whether a row was emitted (skipped rows don't count towards the
@@ -230,9 +256,7 @@ func (f *Fs) emitBQRow(r bqRow, directory, prefix, bucketName string, addBucket 
 	}
 	object := &storage.Object{Name: r.name}
 	if !isDirectory {
-		object.Size, _ = strconv.ParseUint(r.size, 10, 64)
-		object.Md5Hash = r.md5 // base64 (converted from the inventory's hex in SQL), as setMetaData expects
-		object.Updated = r.updated
+		object = bqRowObject(r)
 	}
 	if err := fn(remote, object, isDirectory); err != nil {
 		return false, err

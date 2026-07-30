@@ -317,30 +317,53 @@ of the list API. Object **downloads** still go through Cloud Storage.
     type = google cloud storage
     service_account_file = /path/to/sa.json
     bigquery_table = my-project.inventory.gcs_objects
+    bigquery_cache_db = /var/lib/rclone/gcs-cache.bolt
 
-The table must have columns `bucket`, `name`, `size`, `md5Hash`, `updated`
-and `snapshotTime`. Each listing query pins to the latest `snapshotTime`
-for the bucket, so results reflect the most recent report - which lags live
-bucket state, so an object written since the last report won't appear until
-the next one runs.
+The table must have columns `bucket`, `name`, `size`, `md5Hash` and
+`updated`. Results reflect the most recent inventory report, which lags
+live bucket state, so an object written since the last report won't appear
+until the cache is repopulated from a newer one.
+
+`bigquery_cache_db` is required and points at a local bbolt file. Listings
+are always served from it, never from BigQuery: one recursive query over
+the whole bucket populates the cache, and every list - single-level
+browsing, recursive `--fast-list`, and object stats - is then answered
+locally. This keeps a tree walk to a single BigQuery job instead of one per
+directory.
+
+The cache is repopulated in three ways:
+
+- **In the background**, once it is older than `bigquery_cache_max_age`
+  (default 48h). The list that notices the age keeps serving the existing
+  snapshot and returns immediately while one repopulate runs behind it, so
+  a refresh never stalls a mount. Only a completely empty cache blocks,
+  because there is nothing to serve yet.
+- **On demand**, with `rclone backend refresh remote:bucket` - see
+  [backend commands](#backend-commands) below. This is the one to run from
+  cron after the inventory report updates; it fails with a non-zero exit if
+  the query errors, times out, or returns no rows, and keeps serving the
+  previous snapshot in all three cases.
+- **On first use**, when no snapshot exists yet.
 
 Notes:
 
-- Listing a directory with very many objects is bounded by BigQuery's REST
-  result API (`getQueryResults`), which returns large result sets slowly -
-  e.g. a flat directory of ~100k objects takes tens of seconds even though
-  the query itself runs in a few seconds. Under `rclone mount` this only
-  bites the first listing of such a directory; raise `--dir-cache-time` so
-  it is served from cache afterwards. (A faster path via the BigQuery Storage
-  Read API is possible but would add a dependency.)
+- A populate is bounded by BigQuery's REST result API
+  (`getQueryResults`), which returns large result sets slowly - budget for
+  it taking substantially longer than the query itself. `bigquery_timeout`
+  (default 10m) caps it. This cost is paid once per refresh, not per
+  listing.
+- `bigquery_cache_db` must be a local path owned by a single rclone process:
+  bbolt takes an exclusive lock and memory-maps the file, so it can be
+  neither shared between machines nor opened by a second rclone while a
+  mount is running. Use the rc API to refresh a running mount's cache.
 - This needs a BigQuery read scope in addition to the storage scope. With a
   service account or `env_auth` it is requested automatically; with
   interactive oauth you must `rclone config reconnect` to re-consent.
 - The query runs in (and is billed to) the project from
   `bigquery_billing_project`, or a fully-qualified `project.dataset.table`,
   or the service account's `project_id`.
-- This is most useful behind the [overlay](/overlay/) backend, listing a GCS
-  origin while reading object data from another remote.
+- This is most useful behind the `overlay` backend, listing a GCS origin
+  while reading object data from another remote.
 
 ### Custom upload headers
 
@@ -863,13 +886,12 @@ Properties:
 
 BigQuery table holding a GCS Storage Insights inventory report.
 
-If set, object listings (both single-level and recursive) are served by querying
-this table instead of the Cloud Storage list API - useful for very large buckets.
-Give a fully-qualified `project.dataset.table` (or `dataset.table` with
-bigquery_billing_project set). The table must have columns: bucket, name, size,
-md5Hash, updated, snapshotTime. Each query pins to the latest snapshotTime per
-bucket, so listings reflect the most recent inventory report (which lags live
-bucket state). Object downloads still go through Cloud Storage.
+If set, object listings are served from a local bbolt cache populated from this
+table instead of the Cloud Storage list API - useful for very large buckets. This
+requires bigquery_cache_db to be set. Give a fully-qualified `project.dataset.table`
+(or `dataset.table` with bigquery_billing_project set). The table must have
+columns: bucket, name, size, md5Hash, updated. Object downloads still go through
+Cloud Storage.
 
 This needs a BigQuery read scope in addition to the storage scope; with oauth
 (not service account/env auth) you must reconnect to re-consent.
@@ -895,6 +917,60 @@ Properties:
 - Type:        string
 - Required:    false
 
+#### --gcs-bigquery-cache-db
+
+Local bbolt file caching bigquery_table listings (required with bigquery_table).
+
+Required whenever bigquery_table is set. Point it at a writable local file path -
+e.g. /var/lib/rclone/gcs-cache.bolt. Every list is served from this file with no
+BigQuery traffic; the cache is repopulated in one BigQuery query - in the
+background once it ages past bigquery_cache_max_age (lists keep serving the old
+snapshot meanwhile), synchronously only when it is empty, or on demand via
+"rclone backend refresh remote:bucket" (against a running mount, which holds the
+file lock: "rclone rc backend/command command=refresh fs=remote:bucket").
+
+Must be a local path owned by a single rclone process (bbolt takes an exclusive
+lock and memory-maps the file) - never share it between multiple machines.
+
+Properties:
+
+- Config:      bigquery_cache_db
+- Env Var:     RCLONE_GCS_BIGQUERY_CACHE_DB
+- Type:        string
+- Required:    false
+
+#### --gcs-bigquery-cache-max-age
+
+How stale a bigquery_cache_db entry may be before it is refreshed.
+
+A list served from a cache older than this triggers one full repopulate in the
+background (still a single BigQuery query, never one-per-directory) while the
+old snapshot keeps being served. This drives periodic refresh on its own when
+nothing external refreshes the cache, and acts as a safety net when something
+does (e.g. a cron running the "refresh" backend command after the inventory
+updates). Set to 0 to serve from the cache no matter how old it is.
+
+Properties:
+
+- Config:      bigquery_cache_max_age
+- Env Var:     RCLONE_GCS_BIGQUERY_CACHE_MAX_AGE
+- Type:        Duration
+- Default:     2d
+
+#### --gcs-bigquery-timeout
+
+Timeout for one bigquery_table populate query (job plus result pagination).
+
+A populate exceeding this fails; an existing cache generation keeps being served
+and the populate retries after a cooldown. Set to 0 to disable.
+
+Properties:
+
+- Config:      bigquery_timeout
+- Env Var:     RCLONE_GCS_BIGQUERY_TIMEOUT
+- Type:        Duration
+- Default:     10m0s
+
 #### --gcs-description
 
 Description of the remote.
@@ -905,6 +981,52 @@ Properties:
 - Env Var:     RCLONE_GCS_DESCRIPTION
 - Type:        string
 - Required:    false
+
+## Backend commands
+
+Here are the commands specific to the google cloud storage backend.
+
+Run them with:
+
+```console
+rclone backend COMMAND remote:
+```
+
+The help below will explain what arguments each command takes.
+
+See the [backend](/commands/rclone_backend/) command for more
+info on how to pass options and arguments.
+
+These can be run on a running backend using the rc command
+[backend/command](/rc/#backend-command).
+
+### refresh
+
+Force a repopulate of the bigquery_table listing cache
+
+```console
+rclone backend refresh remote: [options] [<arguments>+]
+```
+
+Runs one recursive BigQuery inventory query for the remote's bucket and
+atomically swaps the bbolt listing cache to the new snapshot. Ignores
+bigquery_cache_max_age and the failure cooldown. Intended for a cron job after
+the Storage Insights inventory updates:
+
+    rclone backend refresh gcs-bq:bucket
+
+Against a running mount (which holds the cache file's exclusive lock), use the
+remote control API instead. Backend commands are authenticated, so the mount
+needs --rc together with either --rc-no-auth or --rc-user/--rc-pass:
+
+    rclone rc backend/command command=refresh fs=gcs-bq:bucket
+
+The fs argument must match the remote string the mount opened, so that rclone
+reuses the running instance rather than opening a second one (which would fail
+on the cache file's lock).
+
+Fails if the query errors, times out (bigquery_timeout), or returns zero rows -
+in all cases the previous snapshot is kept and served.
 
 <!-- autogenerated options stop -->
 

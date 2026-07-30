@@ -96,7 +96,7 @@ var fixtureRows = []bqRow{
 
 func TestBQCacheServe(t *testing.T) {
 	f := newTestCacheFs(t)
-	if err := f.bqPopulate(context.Background(), "buck", "", "", false, nil, sliceSource(fixtureRows)); err != nil {
+	if err := f.bqPopulate("buck", sliceSource(fixtureRows)); err != nil {
 		t.Fatalf("populate: %v", err)
 	}
 
@@ -124,7 +124,7 @@ func TestBQCacheServe(t *testing.T) {
 
 func TestBQCacheObjectFields(t *testing.T) {
 	f := newTestCacheFs(t)
-	if err := f.bqPopulate(context.Background(), "buck", "", "", false, nil, sliceSource(fixtureRows)); err != nil {
+	if err := f.bqPopulate("buck", sliceSource(fixtureRows)); err != nil {
 		t.Fatalf("populate: %v", err)
 	}
 	var obj *storage.Object
@@ -147,14 +147,13 @@ func TestBQCacheObjectFields(t *testing.T) {
 
 func TestBQCacheGenerationSwap(t *testing.T) {
 	f := newTestCacheFs(t)
-	ctx := context.Background()
-	if err := f.bqPopulate(ctx, "buck", "", "", false, nil, sliceSource([]bqRow{{name: "old.txt", size: "1"}})); err != nil {
+	if err := f.bqPopulate("buck", sliceSource([]bqRow{{name: "old.txt", size: "1"}})); err != nil {
 		t.Fatal(err)
 	}
 	if gen := readGen(t, f, "buck"); gen != 1 {
 		t.Fatalf("first populate generation = %d, want 1", gen)
 	}
-	if err := f.bqPopulate(ctx, "buck", "", "", false, nil, sliceSource([]bqRow{{name: "new.txt", size: "2"}})); err != nil {
+	if err := f.bqPopulate("buck", sliceSource([]bqRow{{name: "new.txt", size: "2"}})); err != nil {
 		t.Fatal(err)
 	}
 	if gen := readGen(t, f, "buck"); gen != 2 {
@@ -180,11 +179,10 @@ func TestBQCacheGenerationSwap(t *testing.T) {
 // an empty source (broken/empty inventory) must not flip and wipe a good cache.
 func TestBQCacheEmptySourceKeepsCache(t *testing.T) {
 	f := newTestCacheFs(t)
-	ctx := context.Background()
-	if err := f.bqPopulate(ctx, "buck", "", "", false, nil, sliceSource([]bqRow{{name: "keep.txt", size: "1"}})); err != nil {
+	if err := f.bqPopulate("buck", sliceSource([]bqRow{{name: "keep.txt", size: "1"}})); err != nil {
 		t.Fatal(err)
 	}
-	if err := f.bqPopulate(ctx, "buck", "", "", false, nil, sliceSource(nil)); err != nil {
+	if err := f.bqPopulate("buck", sliceSource(nil)); err != nil {
 		t.Fatal(err)
 	}
 	if gen := readGen(t, f, "buck"); gen != 1 {
@@ -197,14 +195,13 @@ func TestBQCacheEmptySourceKeepsCache(t *testing.T) {
 
 func TestBQCacheStale(t *testing.T) {
 	f := newTestCacheFs(t)
-	ctx := context.Background()
 
 	// cold: no generation yet
 	if stale, err := f.bqCacheStale("buck"); err != nil || !stale {
 		t.Fatalf("cold: stale=%v err=%v, want stale", stale, err)
 	}
 
-	if err := f.bqPopulate(ctx, "buck", "", "", false, nil, sliceSource([]bqRow{{name: "a.txt", size: "1"}})); err != nil {
+	if err := f.bqPopulate("buck", sliceSource([]bqRow{{name: "a.txt", size: "1"}})); err != nil {
 		t.Fatal(err)
 	}
 	if stale, err := f.bqCacheStale("buck"); err != nil || stale {
