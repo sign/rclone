@@ -27,6 +27,7 @@ import (
 	"sync"
 	"time"
 
+	bq "cloud.google.com/go/bigquery"
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/config"
 	"github.com/rclone/rclone/fs/config/configmap"
@@ -44,7 +45,6 @@ import (
 	bolt "go.etcd.io/bbolt"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
-	bigquery "google.golang.org/api/bigquery/v2"
 	"google.golang.org/api/googleapi"
 	option "google.golang.org/api/option"
 
@@ -60,7 +60,7 @@ const (
 	metaMtimeGsutil             = "goog-reserved-file-mtime" // key used by GSUtil to store mtime in metadata
 	listChunks                  = 1000                       // chunk size to read directory listings
 	minSleep                    = 10 * time.Millisecond
-	bigQueryReadonlyScope       = "https://www.googleapis.com/auth/bigquery.readonly" // not exported by bigquery/v2
+	bigQueryReadonlyScope       = "https://www.googleapis.com/auth/bigquery.readonly" // accepted by both query jobs and the Storage Read API
 )
 
 var (
@@ -401,7 +401,13 @@ columns: bucket, name, size, md5Hash, updated. Object downloads still go through
 Cloud Storage.
 
 This needs a BigQuery read scope in addition to the storage scope; with oauth
-(not service account/env auth) you must reconnect to re-consent.`,
+(not service account/env auth) you must reconnect to re-consent.
+
+Results are downloaded through the BigQuery Storage Read API, which must be
+enabled on the billing project, and the credentials need
+roles/bigquery.readSessionUser there (in addition to job-running and
+table-reading rights). Without it, large populates fail rather than fall back
+to the slow serial REST download.`,
 		}, {
 			Name:     "bigquery_billing_project",
 			Advanced: true,
@@ -440,7 +446,7 @@ updates). Set to 0 to serve from the cache no matter how old it is.`,
 			Name:     "bigquery_timeout",
 			Advanced: true,
 			Default:  fs.Duration(10 * time.Minute),
-			Help: `Timeout for one bigquery_table populate query (job plus result pagination).
+			Help: `Timeout for one bigquery_table populate query (job plus result download).
 
 A populate exceeding this fails; an existing cache generation keeps being served
 and the populate retries after a cooldown. Set to 0 to disable.`,
@@ -476,23 +482,23 @@ type Options struct {
 
 // Fs represents a remote storage server
 type Fs struct {
-	name           string            // name of this remote
-	root           string            // the path we are working on if any
-	opt            Options           // parsed options
-	features       *fs.Features      // optional features
-	svc            *storage.Service  // the connection to the storage server
-	client         *http.Client      // authorized client
-	rootBucket     string            // bucket part of root (if any)
-	rootDirectory  string            // directory part of root (if any)
-	cache          *bucket.Cache     // cache of bucket status
-	pacer          *fs.Pacer         // To pace the API calls
-	warnCompressed sync.Once         // warn once about compressed files
-	bqSvc          *bigquery.Service // BigQuery client, non-nil only when listing from bigquery_table
-	bqProject      string            // project that runs/bills the inventory query
-	bqDB           *bolt.DB          // bbolt listing cache, non-nil only when bigquery_cache_db is set
-	bqPopMu        sync.Mutex        // serialises cache (re)populates so a herd of reads triggers one query
-	bqLastPopFail  time.Time         // last failed populate; bounds retries during an outage, guarded by bqPopMu
-	bqCtx          context.Context   // background-populate context: detached from list callers, cancelled by Shutdown
+	name           string           // name of this remote
+	root           string           // the path we are working on if any
+	opt            Options          // parsed options
+	features       *fs.Features     // optional features
+	svc            *storage.Service // the connection to the storage server
+	client         *http.Client     // authorized client
+	rootBucket     string           // bucket part of root (if any)
+	rootDirectory  string           // directory part of root (if any)
+	cache          *bucket.Cache    // cache of bucket status
+	pacer          *fs.Pacer        // To pace the API calls
+	warnCompressed sync.Once        // warn once about compressed files
+	bqClient       *bq.Client       // BigQuery client, non-nil only when listing from bigquery_table
+	bqProject      string           // project that runs/bills the inventory query
+	bqDB           *bolt.DB         // bbolt listing cache, non-nil only when bigquery_cache_db is set
+	bqPopMu        sync.Mutex       // serialises cache (re)populates so a herd of reads triggers one query
+	bqLastPopFail  time.Time        // last failed populate; bounds retries during an outage, guarded by bqPopMu
+	bqCtx          context.Context  // background-populate context: detached from list callers, cancelled by Shutdown
 	bqCancel       context.CancelFunc
 	bqWG           sync.WaitGroup // in-flight background populates, drained by Shutdown before closing bqDB
 	// bqQuery is the sole entry to a BigQuery listing query and the gate for the
@@ -594,13 +600,14 @@ func (o *Object) split() (bucket, bucketPath string) {
 	return o.fs.split(o.remote)
 }
 
-func getServiceAccountClient(ctx context.Context, credentialsData []byte, scopes []string) (*http.Client, error) {
+func getServiceAccountClient(ctx context.Context, credentialsData []byte, scopes []string) (*http.Client, oauth2.TokenSource, error) {
 	conf, err := google.JWTConfigFromJSON(credentialsData, scopes...)
 	if err != nil {
-		return nil, fmt.Errorf("error processing credentials: %w", err)
+		return nil, nil, fmt.Errorf("error processing credentials: %w", err)
 	}
 	ctxWithSpecialClient := oauthutil.Context(ctx, fshttp.NewClient(ctx))
-	return oauth2.NewClient(ctxWithSpecialClient, conf.TokenSource(ctxWithSpecialClient)), nil
+	ts := conf.TokenSource(ctxWithSpecialClient)
+	return oauth2.NewClient(ctxWithSpecialClient, ts), ts, nil
 }
 
 // setRoot changes the root of the Fs
@@ -617,10 +624,14 @@ func (f *Fs) Shutdown(ctx context.Context) error {
 		f.bqCancel()
 	}
 	f.bqWG.Wait()
-	if f.bqDB != nil {
-		return f.bqDB.Close()
+	var errs []error
+	if f.bqClient != nil {
+		errs = append(errs, f.bqClient.Close())
 	}
-	return nil
+	if f.bqDB != nil {
+		errs = append(errs, f.bqDB.Close())
+	}
+	return errors.Join(errs...)
 }
 
 // NewFs constructs an Fs from the path, bucket:path
@@ -661,25 +672,34 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		envScopes = append(envScopes, bigQueryReadonlyScope)
 	}
 
+	// the BigQuery Storage Read client is gRPC, which can't reuse the authorized
+	// http.Client (option.WithHTTPClient is HTTP-only), so every auth mode also
+	// keeps its oauth2.TokenSource for the BigQuery client to use directly
+	var bqTokenSource oauth2.TokenSource
 	if opt.Anonymous {
 		if opt.BigQueryTable != "" {
 			return nil, errors.New("bigquery_table can't be used with anonymous access")
 		}
 		oAuthClient = fshttp.NewClient(ctx)
 	} else if opt.ServiceAccountCredentials != "" {
-		oAuthClient, err = getServiceAccountClient(ctx, []byte(opt.ServiceAccountCredentials), saScopes)
+		oAuthClient, bqTokenSource, err = getServiceAccountClient(ctx, []byte(opt.ServiceAccountCredentials), saScopes)
 		if err != nil {
 			return nil, fmt.Errorf("failed configuring Google Cloud Storage Service Account: %w", err)
 		}
 	} else if opt.EnvAuth {
-		oAuthClient, err = google.DefaultClient(ctx, envScopes...)
+		// FindDefaultCredentials + NewClient is what google.DefaultClient does,
+		// unrolled so the token source survives for the BigQuery client
+		creds, err := google.FindDefaultCredentials(ctx, envScopes...)
 		if err != nil {
 			return nil, fmt.Errorf("failed to configure Google Cloud Storage: %w", err)
 		}
+		bqTokenSource = creds.TokenSource
+		oAuthClient = oauth2.NewClient(ctx, creds.TokenSource)
 	} else if opt.AccessToken != "" {
 		// a supplied access_token must already carry the bigquery scope when bigquery_table is set
 		ts := oauth2.Token{AccessToken: opt.AccessToken}
-		oAuthClient = oauth2.NewClient(ctx, oauth2.StaticTokenSource(&ts))
+		bqTokenSource = oauth2.StaticTokenSource(&ts)
+		oAuthClient = oauth2.NewClient(ctx, bqTokenSource)
 	} else {
 		oauthCfg := storageConfig
 		if opt.BigQueryTable != "" {
@@ -687,13 +707,18 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 			cfgCopy.Scopes = saScopes
 			oauthCfg = &cfgCopy
 		}
-		oAuthClient, _, err = oauthutil.NewClient(ctx, name, m, oauthCfg)
-		if err != nil {
+		var oauthTS *oauthutil.TokenSource
+		oAuthClient, oauthTS, err = oauthutil.NewClient(ctx, name, m, oauthCfg)
+		if err == nil {
+			bqTokenSource = oauthTS
+		} else {
 			ctx := context.Background()
-			oAuthClient, err = google.DefaultClient(ctx, envScopes...)
+			creds, err := google.FindDefaultCredentials(ctx, envScopes...)
 			if err != nil {
 				return nil, fmt.Errorf("failed to configure Google Cloud Storage: %w", err)
 			}
+			bqTokenSource = creds.TokenSource
+			oAuthClient = oauth2.NewClient(ctx, creds.TokenSource)
 		}
 	}
 
@@ -731,10 +756,19 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		if err != nil {
 			return nil, err
 		}
+		// background populates must outlive the list call that kicked them, but
+		// still stop on Shutdown; WithoutCancel keeps the config values from ctx.
+		// The BigQuery client is built on this context too, matching its lifetime.
+		f.bqCtx, f.bqCancel = context.WithCancel(context.WithoutCancel(ctx))
 		// no custom endpoint: opt.Endpoint is storage-only and doesn't apply to BigQuery
-		f.bqSvc, err = bigquery.NewService(ctx, option.WithHTTPClient(f.client))
+		f.bqClient, err = bq.NewClient(f.bqCtx, f.bqProject, option.WithTokenSource(bqTokenSource))
 		if err != nil {
 			return nil, fmt.Errorf("couldn't create BigQuery client: %w", err)
+		}
+		// route result downloads through the Storage Read API (parallel gRPC
+		// streams) instead of serial getQueryResults paging
+		if err := f.bqClient.EnableStorageReadClient(f.bqCtx, option.WithTokenSource(bqTokenSource)); err != nil {
+			return nil, fmt.Errorf("couldn't create BigQuery Storage Read client: %w", err)
 		}
 		f.bqQuery = f.bqQueryRows // real BigQuery query; also gates the BigQuery path
 		f.bqNotFound = f.bqVerifyNotFound
@@ -742,9 +776,6 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		if err != nil {
 			return nil, err
 		}
-		// background populates must outlive the list call that kicked them, but
-		// still stop on Shutdown; WithoutCancel keeps the config values from ctx
-		f.bqCtx, f.bqCancel = context.WithCancel(context.WithoutCancel(ctx))
 	}
 
 	if f.rootBucket != "" && f.rootDirectory != "" {

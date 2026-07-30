@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	bigquery "google.golang.org/api/bigquery/v2"
+	bq "cloud.google.com/go/bigquery"
 )
 
 func TestObjectRemote(t *testing.T) {
@@ -36,7 +36,7 @@ func TestBQListQuery(t *testing.T) {
 	f.opt.BigQueryTable = "proj.ds.tbl"
 
 	rec, params := f.bqListQuery("buck", "photos/", true)
-	for _, want := range []string{"FROM `proj.ds.tbl`", "STARTS_WITH(name, @dir)", "TO_BASE64(FROM_HEX(md5Hash))", "QUALIFY ROW_NUMBER() OVER (PARTITION BY name ORDER BY snapshotTime DESC) = 1"} {
+	for _, want := range []string{"FROM `proj.ds.tbl`", "STARTS_WITH(name, IFNULL(@dir, ''))", "TO_BASE64(FROM_HEX(md5Hash))", "QUALIFY ROW_NUMBER() OVER (PARTITION BY name ORDER BY snapshotTime DESC) = 1"} {
 		if !strings.Contains(rec, want) {
 			t.Errorf("recursive query missing %q:\n%s", want, rec)
 		}
@@ -46,7 +46,7 @@ func TestBQListQuery(t *testing.T) {
 	if strings.Contains(rec, "ORDER BY name,") {
 		t.Errorf("recursive query reintroduced a global ORDER BY:\n%s", rec)
 	}
-	if len(params) != 2 || params[0].ParameterValue.Value != "buck" || params[1].ParameterValue.Value != "photos/" {
+	if len(params) != 2 || params[0].Value != "buck" || params[1].Value != "photos/" {
 		t.Errorf("unexpected params: %+v", params)
 	}
 
@@ -77,18 +77,18 @@ func TestResolveBQProject(t *testing.T) {
 	}
 }
 
-func TestCellString(t *testing.T) {
+func TestValueString(t *testing.T) {
 	for _, tc := range []struct {
-		cell *bigquery.TableCell
+		v    bq.Value
 		want string
 	}{
-		{cell: nil, want: ""},
-		{cell: &bigquery.TableCell{V: nil}, want: ""},
-		{cell: &bigquery.TableCell{V: "x"}, want: "x"},
-		{cell: &bigquery.TableCell{V: 5}, want: "5"},
+		{v: nil, want: ""},
+		{v: "x", want: "x"},
+		{v: int64(9223372036854), want: "9223372036854"},
+		{v: 5, want: "5"},
 	} {
-		if got := cellString(tc.cell); got != tc.want {
-			t.Errorf("cellString(%+v) = %q; want %q", tc.cell, got, tc.want)
+		if got := valueString(tc.v); got != tc.want {
+			t.Errorf("valueString(%+v) = %q; want %q", tc.v, got, tc.want)
 		}
 	}
 }
