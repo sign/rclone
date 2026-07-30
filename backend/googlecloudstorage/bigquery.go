@@ -22,11 +22,14 @@ import (
 	storage "google.golang.org/api/storage/v1"
 )
 
-// bqPageSize is the row count requested per BigQuery results page. Deliberately
-// large: getQueryResults caps each response at ~10MB and returns a pageToken for
-// the rest, so a high value just minimises round-trips (a flat 100k-object
-// directory then needs a handful of pages instead of ~100 at 1000/page).
-const bqPageSize = 100000
+// bqPageSize is the row count requested per BigQuery results page and the
+// parallel download's chunk size. getQueryResults caps each response at ~10MB,
+// which is ~87k rows of this inventory's row width - asking for more than the
+// cap made every chunk cost TWO requests (a capped big page plus a 4-22s tail
+// for the remainder; ~93 wasted requests on a 9.26M-row corpus). 80k stays
+// under the cap so a chunk is one request; the within-chunk short-page loop
+// remains the safety net if wider rows ever push the cap below this.
+const bqPageSize = 80000
 
 // bqFetchConcurrency is how many getQueryResults pages are fetched in parallel
 // once the job is complete (random access via StartIndex). The download is the
