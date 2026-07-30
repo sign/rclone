@@ -145,9 +145,9 @@ func TestBQCacheObjectFields(t *testing.T) {
 	}
 }
 
-// A changed object appears once per snapshotTime it was captured at; the query
-// orders by (name, snapshotTime), so the newest row arrives last and bbolt's
-// last-Put-wins must leave exactly its metadata in the cache.
+// The query's QUALIFY dedup means duplicate names shouldn't reach the cache at
+// all, but if one ever slips through, bbolt's last-Put-wins is the fallback -
+// this pins that a later row for the same name replaces the earlier one.
 func TestBQCachePopulateDuplicateNameKeepsNewest(t *testing.T) {
 	f := newTestCacheFs(t)
 	if err := f.bqPopulate("buck", sliceSource([]bqRow{
