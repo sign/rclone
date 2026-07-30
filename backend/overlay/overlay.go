@@ -250,17 +250,28 @@ func (o *Object) String() string {
 // The read-remote NewObject is a HeadObject. With R2 + Sippy enabled this proxies
 // origin metadata and returns 200 even for keys not yet migrated, so an error here
 // means the key is genuinely absent.
+//
+// The HEAD runs outside o.mu: holding a mutex across a network round-trip
+// serialises concurrent first opens of the same object. A rare duplicate HEAD
+// on a racing first open is cheaper than that.
 func (o *Object) readObject(ctx context.Context) (fs.Object, error) {
 	o.mu.Lock()
-	defer o.mu.Unlock()
-	if o.readObj != nil {
-		return o.readObj, nil
+	ro := o.readObj
+	o.mu.Unlock()
+	if ro != nil {
+		return ro, nil
 	}
 	ro, err := o.f.readFs.NewObject(ctx, o.Object.Remote())
 	if err != nil {
 		return nil, err
 	}
-	o.readObj = ro
+	o.mu.Lock()
+	if o.readObj == nil {
+		o.readObj = ro
+	} else {
+		ro = o.readObj // keep the racer's winner so all handles share one object
+	}
+	o.mu.Unlock()
 	return ro, nil
 }
 
