@@ -319,10 +319,18 @@ of the list API. Object **downloads** still go through Cloud Storage.
     bigquery_table = my-project.inventory.gcs_objects
     bigquery_cache_db = /var/lib/rclone/gcs-cache.bolt
 
-The table must have columns `bucket`, `name`, `size`, `md5Hash` and
-`updated`. Results reflect the most recent inventory report, which lags
+The table must have columns `name`, `size`, `md5Hash` and `updated`.
+Results reflect the most recent inventory report, which lags
 live bucket state, so an object written since the last report won't appear
 until the cache is repopulated from a newer one.
+
+The populate reads the whole table, so it must hold exactly one bucket and
+exactly one row per object - each inventory report should replace the
+previous one rather than append to it. A table covering several buckets
+would list one bucket's objects under another, since cache keys are object
+names with no bucket component. Note also that a remote with a path prefix
+(`remote:bucket/prefix`) still caches the whole bucket; listings stay
+correct, the cache is just larger than it needs to be.
 
 `bigquery_cache_db` is required and points at a local bbolt file. Listings
 are always served from it, never from BigQuery: one recursive query over

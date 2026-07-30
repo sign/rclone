@@ -277,6 +277,17 @@ func (f *Fs) bqPopulateLocked(ctx context.Context, bucketName string) (advanced 
 // (BigQuery in production). Caller must hold bqPopMu; callers serve the
 // requested slice from bbolt afterwards, populate never emits entries itself.
 func (f *Fs) bqPopulate(bucketName string, src bqRowSource) error {
+	// Skip fsync for the bulk load: every byte written below goes into a fresh
+	// generation that nothing points at until the flip txn at the end, and an
+	// aborted attempt is deleted by the next populate - so a crash mid-load can
+	// only lose work that was already being discarded. The generation is fsynced
+	// once (db.Sync) before the flip, so the pointer never becomes durable ahead
+	// of the data it names. This removes one fsync per batch (~926 on a 9.26M-row
+	// load) from the critical path.
+	f.bqDB.NoSync = true
+	defer func() { f.bqDB.NoSync = false }()
+
+	start := time.Now()
 	// pick the next generation and start it empty (clears any aborted attempt)
 	var newGen uint64
 	if err := f.bqDB.Update(func(tx *bolt.Tx) error {
@@ -300,14 +311,27 @@ func (f *Fs) bqPopulate(bucketName string, src bqRowSource) error {
 	stop := make(chan struct{}) // closed by the writer on its first error
 	var writeErr error
 	written := 0
+	// time spent inside bbolt txns; written only by the writer goroutine and read
+	// after <-done, so the channel close orders the handoff. Logged next to the
+	// total so a slow populate says plainly whether it was bound by the write
+	// side or by waiting on BigQuery.
+	var writeDur time.Duration
 	go func() {
 		defer close(done)
 		for batch := range batches {
 			if writeErr != nil {
 				continue // already failed; keep draining so the producer never blocks
 			}
+			txStart := time.Now()
 			writeErr = f.bqDB.Update(func(tx *bolt.Tx) error {
 				b := tx.Bucket(bqDataBucket(bucketName, newGen))
+				// rows arrive sorted by name (the query's ORDER BY), so this is an
+				// in-order append into the rightmost leaf: pack pages full instead
+				// of leaving the default half-empty room for mid-page inserts that
+				// sorted input never makes. Coupled to that ORDER BY - with
+				// unsorted rows a full fill percent makes splitting worse, not
+				// better.
+				b.FillPercent = 1.0
 				for _, r := range batch {
 					if err := b.Put([]byte(r.name), bqEncodeValue(r)); err != nil {
 						return err
@@ -315,6 +339,7 @@ func (f *Fs) bqPopulate(bucketName string, src bqRowSource) error {
 				}
 				return nil
 			})
+			writeDur += time.Since(txStart)
 			if writeErr != nil {
 				close(stop)
 				continue
@@ -362,7 +387,15 @@ func (f *Fs) bqPopulate(bucketName string, src bqRowSource) error {
 		fs.Infof(f, "BigQuery listing cache: query returned no rows, kept existing cache for %q", bucketName)
 		return nil
 	}
-	fs.Infof(f, "BigQuery listing cache: populated %q with %d objects (gen %d)", bucketName, written, newGen)
+	fs.Infof(f, "BigQuery listing cache: populated %q with %d objects (gen %d) in %v (%v in bbolt writes)",
+		bucketName, written, newGen, time.Since(start).Round(time.Millisecond), writeDur.Round(time.Millisecond))
+
+	// make the new generation durable before anything points at it, then restore
+	// syncing so the flip itself commits durably (see the NoSync note above)
+	if err := f.bqDB.Sync(); err != nil {
+		return fmt.Errorf("syncing new cache generation: %w", err)
+	}
+	f.bqDB.NoSync = false
 
 	// atomic flip + drop the old generation
 	return f.bqDB.Update(func(tx *bolt.Tx) error {
