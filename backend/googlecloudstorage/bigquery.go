@@ -31,9 +31,11 @@ const bqPageSize = 100000
 // bqFetchConcurrency is how many getQueryResults pages are fetched in parallel
 // once the job is complete (random access via StartIndex). The download is the
 // populate's bottleneck: pages are ~10MB and took ~26s each when chained
-// serially through pageTokens in production. ponytail: fixed at 8 (~150MB of
-// transient row data); make it an option if a host ever needs tuning.
-const bqFetchConcurrency = 8
+// serially through pageTokens in production. ponytail: fixed at 16 (~300MB of
+// transient row data); the pacer backs off automatically if BigQuery throttles
+// concurrent readers - drop back toward 8 if 429s show up in the logs, or make
+// it an option if a host ever needs tuning.
+const bqFetchConcurrency = 16
 
 // bqTableRe guards the table reference before it is interpolated into SQL (BigQuery
 // can't bind table names as query parameters). project ids allow dashes; dataset
