@@ -291,40 +291,63 @@ func (f *Fs) bqPopulate(bucketName string, src bqRowSource) error {
 		return err
 	}
 
-	pending := make([]bqRow, 0, bqCacheBatch)
+	// pipeline: this goroutine fetches/parses result pages while a writer
+	// goroutine runs the batched bbolt txns, so the network never waits on an
+	// fsync and vice versa. The small channel buffer bounds memory to a couple
+	// of in-flight batches.
+	batches := make(chan []bqRow, 2)
+	done := make(chan struct{})
+	stop := make(chan struct{}) // closed by the writer on its first error
+	var writeErr error
 	written := 0
-	flush := func() error {
-		if len(pending) == 0 {
-			return nil
-		}
-		err := f.bqDB.Update(func(tx *bolt.Tx) error {
-			b := tx.Bucket(bqDataBucket(bucketName, newGen))
-			for _, r := range pending {
-				if err := b.Put([]byte(r.name), bqEncodeValue(r)); err != nil {
-					return err
-				}
+	go func() {
+		defer close(done)
+		for batch := range batches {
+			if writeErr != nil {
+				continue // already failed; keep draining so the producer never blocks
 			}
-			return nil
-		})
-		if err != nil {
-			return err
+			writeErr = f.bqDB.Update(func(tx *bolt.Tx) error {
+				b := tx.Bucket(bqDataBucket(bucketName, newGen))
+				for _, r := range batch {
+					if err := b.Put([]byte(r.name), bqEncodeValue(r)); err != nil {
+						return err
+					}
+				}
+				return nil
+			})
+			if writeErr != nil {
+				close(stop)
+				continue
+			}
+			written += len(batch)
 		}
-		written += len(pending)
-		pending = pending[:0]
-		return nil
-	}
+	}()
 
+	pending := make([]bqRow, 0, bqCacheBatch)
 	err := src(func(r bqRow) error {
 		pending = append(pending, r)
 		if len(pending) >= bqCacheBatch {
-			return flush()
+			select {
+			case batches <- pending:
+				pending = make([]bqRow, 0, bqCacheBatch)
+			case <-stop:
+				return writeErr // safe: close(stop) is ordered after writeErr was set
+			}
 		}
 		return nil
 	})
-	if err != nil {
-		return err
+	if err == nil && len(pending) > 0 {
+		select {
+		case batches <- pending:
+		case <-stop:
+		}
 	}
-	if err := flush(); err != nil {
+	close(batches)
+	<-done
+	if err == nil {
+		err = writeErr
+	}
+	if err != nil {
 		return err
 	}
 

@@ -145,6 +145,35 @@ func TestBQCacheObjectFields(t *testing.T) {
 	}
 }
 
+// A changed object appears once per snapshotTime it was captured at; the query
+// orders by (name, snapshotTime), so the newest row arrives last and bbolt's
+// last-Put-wins must leave exactly its metadata in the cache.
+func TestBQCachePopulateDuplicateNameKeepsNewest(t *testing.T) {
+	f := newTestCacheFs(t)
+	if err := f.bqPopulate("buck", sliceSource([]bqRow{
+		{name: "a.txt", size: "10", md5: "old", updated: "2024-01-01T00:00:00Z"},
+		{name: "a.txt", size: "20", md5: "new", updated: "2024-06-01T00:00:00Z"},
+	})); err != nil {
+		t.Fatalf("populate: %v", err)
+	}
+	var obj *storage.Object
+	fn := func(remote string, o *storage.Object, _ bool) error {
+		if remote == "a.txt" {
+			obj = o
+		}
+		return nil
+	}
+	if err := f.bqServe(context.Background(), "buck", "", "", false, true, fn); err != nil {
+		t.Fatal(err)
+	}
+	if obj == nil {
+		t.Fatal("a.txt not served")
+	}
+	if obj.Size != 20 || obj.Md5Hash != "new" || obj.Updated != "2024-06-01T00:00:00Z" {
+		t.Errorf("duplicate name kept size %d md5 %q updated %q; want the newest row", obj.Size, obj.Md5Hash, obj.Updated)
+	}
+}
+
 func TestBQCacheGenerationSwap(t *testing.T) {
 	f := newTestCacheFs(t)
 	if err := f.bqPopulate("buck", sliceSource([]bqRow{{name: "old.txt", size: "1"}})); err != nil {

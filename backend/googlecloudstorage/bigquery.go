@@ -88,9 +88,15 @@ func (f *Fs) bqListQuery(bucketName, directory string, recurse bool) (string, []
 	const md5 = "TO_BASE64(FROM_HEX(md5Hash))" // Storage Insights stores md5Hash as hex; setMetaData wants base64
 
 	if recurse {
+		// ORDER BY name gives bbolt sequential inserts (its cheap bulk-load path
+		// instead of random B+tree inserts), and the snapshotTime tiebreaker makes
+		// the newest row land last for objects captured more than once, so bbolt's
+		// last-Put-wins is deterministically the freshest metadata. The sort runs
+		// inside the BigQuery job, which was never the slow part.
 		sql := fmt.Sprintf(
 			"SELECT name, size, %s AS md5Hash, %s AS updated "+
-				"FROM `%s` WHERE bucket = @bucket AND STARTS_WITH(name, @dir)",
+				"FROM `%s` WHERE bucket = @bucket AND STARTS_WITH(name, @dir) "+
+				"ORDER BY name, snapshotTime",
 			md5, ts, tbl)
 		return sql, params
 	}
@@ -164,7 +170,11 @@ func (f *Fs) bqQueryRows(ctx context.Context, bucketName, directory string, recu
 		rows      []*bigquery.TableRow
 		pageToken string
 		started   bool
+		jobDone   bool
+		total     int
 	)
+	start := time.Now()
+	pageStart := start
 	for {
 		if !started {
 			// run the query (synchronous; first page comes back inline)
@@ -208,6 +218,13 @@ func (f *Fs) bqQueryRows(ctx context.Context, bucketName, directory string, recu
 			}
 			continue
 		}
+		if !jobDone {
+			// marks where query execution ends and result download begins - the
+			// download (serial ~10MB getQueryResults pages) usually dominates
+			jobDone = true
+			fs.Infof(f, "BigQuery listing cache: query finished in %v, downloading results", time.Since(start).Round(time.Millisecond))
+			pageStart = time.Now()
+		}
 
 		for _, row := range rows {
 			if len(row.F) < 4 {
@@ -226,6 +243,10 @@ func (f *Fs) bqQueryRows(ctx context.Context, bucketName, directory string, recu
 				return err
 			}
 		}
+
+		total += len(rows)
+		fs.Infof(f, "BigQuery listing cache: fetched %d rows (%d total) in %v", len(rows), total, time.Since(pageStart).Round(time.Millisecond))
+		pageStart = time.Now()
 
 		if pageToken == "" {
 			break
