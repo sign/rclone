@@ -82,6 +82,7 @@ func init() {
 		Prefix:      "gcs",
 		Description: "Google Cloud Storage (this is not Google Drive)",
 		NewFs:       NewFs,
+		CommandHelp: commandHelp,
 		Config: func(ctx context.Context, name string, m configmap.Mapper, config fs.ConfigIn) (*fs.ConfigOut, error) {
 			saFile, _ := m.Get("service_account_file")
 			saCreds, _ := m.Get("service_account_credentials")
@@ -414,10 +415,12 @@ service account credentials' project_id.`,
 			Help: `Local bbolt file caching bigquery_table listings (required with bigquery_table).
 
 Required whenever bigquery_table is set. Point it at a writable local file path -
-e.g. /var/lib/rclone/gcs-cache.bolt. A recursive list at the remote root (such as
-"rclone rc vfs/refresh recursive=true", or automatically once the cache ages past
-bigquery_cache_max_age) repopulates the whole cache in one BigQuery query, and
-every other list is then served from the file with no BigQuery traffic.
+e.g. /var/lib/rclone/gcs-cache.bolt. Every list is served from this file with no
+BigQuery traffic; the cache is repopulated in one BigQuery query - in the
+background once it ages past bigquery_cache_max_age (lists keep serving the old
+snapshot meanwhile), synchronously only when it is empty, or on demand via
+"rclone backend refresh remote:bucket" (against a running mount, which holds the
+file lock: "rclone rc backend/command command=refresh fs=remote:bucket").
 
 Must be a local path owned by a single rclone process (bbolt takes an exclusive
 lock and memory-maps the file) - never share it between multiple machines.`,
@@ -425,13 +428,22 @@ lock and memory-maps the file) - never share it between multiple machines.`,
 			Name:     "bigquery_cache_max_age",
 			Advanced: true,
 			Default:  fs.Duration(48 * time.Hour),
-			Help: `How stale a bigquery_cache_db entry may be before a list repopulates it.
+			Help: `How stale a bigquery_cache_db entry may be before it is refreshed.
 
-A list served from a cache older than this first triggers one full repopulate
-(still a single BigQuery query, never one-per-directory). This drives periodic
-refresh on its own when nothing external refreshes the cache, and acts as a
-safety net when something does. Set to 0 to serve from the cache no matter how
-old it is.`,
+A list served from a cache older than this triggers one full repopulate in the
+background (still a single BigQuery query, never one-per-directory) while the
+old snapshot keeps being served. This drives periodic refresh on its own when
+nothing external refreshes the cache, and acts as a safety net when something
+does (e.g. a cron running the "refresh" backend command after the inventory
+updates). Set to 0 to serve from the cache no matter how old it is.`,
+		}, {
+			Name:     "bigquery_timeout",
+			Advanced: true,
+			Default:  fs.Duration(10 * time.Minute),
+			Help: `Timeout for one bigquery_table populate query (job plus result pagination).
+
+A populate exceeding this fails; an existing cache generation keeps being served
+and the populate retries after a cooldown. Set to 0 to disable.`,
 		}}...),
 	})
 }
@@ -459,6 +471,7 @@ type Options struct {
 	BigQueryBillingProject    string               `config:"bigquery_billing_project"`
 	BigQueryCacheDB           string               `config:"bigquery_cache_db"`
 	BigQueryCacheMaxAge       fs.Duration          `config:"bigquery_cache_max_age"`
+	BigQueryTimeout           fs.Duration          `config:"bigquery_timeout"`
 }
 
 // Fs represents a remote storage server
@@ -479,6 +492,9 @@ type Fs struct {
 	bqDB           *bolt.DB          // bbolt listing cache, non-nil only when bigquery_cache_db is set
 	bqPopMu        sync.Mutex        // serialises cache (re)populates so a herd of reads triggers one query
 	bqLastPopFail  time.Time         // last failed populate; bounds retries during an outage, guarded by bqPopMu
+	bqCtx          context.Context   // background-populate context: detached from list callers, cancelled by Shutdown
+	bqCancel       context.CancelFunc
+	bqWG           sync.WaitGroup // in-flight background populates, drained by Shutdown before closing bqDB
 	// bqQuery is the sole entry to a BigQuery listing query and the gate for the
 	// whole BigQuery path (non-nil iff bigquery_table is set). It defaults to
 	// bqQueryRows; tests swap in a fake to count and fake BigQuery calls.
@@ -593,8 +609,14 @@ func (f *Fs) setRoot(root string) {
 	f.rootBucket, f.rootDirectory = bucket.Split(f.root)
 }
 
-// Shutdown closes the bigquery_cache_db bbolt handle if one is open.
+// Shutdown aborts any in-flight background populate, waits for it to finish,
+// then closes the bigquery_cache_db bbolt handle. An aborted populate never
+// flips the generation, so the on-disk snapshot stays complete.
 func (f *Fs) Shutdown(ctx context.Context) error {
+	if f.bqCancel != nil {
+		f.bqCancel()
+	}
+	f.bqWG.Wait()
 	if f.bqDB != nil {
 		return f.bqDB.Close()
 	}
@@ -720,6 +742,9 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		if err != nil {
 			return nil, err
 		}
+		// background populates must outlive the list call that kicked them, but
+		// still stop on Shutdown; WithoutCancel keeps the config values from ctx
+		f.bqCtx, f.bqCancel = context.WithCancel(context.WithoutCancel(ctx))
 	}
 
 	if f.rootBucket != "" && f.rootDirectory != "" {
@@ -768,6 +793,14 @@ func (f *Fs) newObjectWithInfo(ctx context.Context, remote string, info *storage
 // NewObject finds the Object at remote.  If it can't be found
 // it returns the error fs.ErrorObjectNotFound.
 func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
+	// in bigquery_table mode answer the stat from the bbolt cache: no network
+	// round-trip. A miss (e.g. an object newer than the inventory) falls back
+	// to a real Objects.Get - never to BigQuery.
+	if f.bqQuery != nil {
+		if info, ok := f.bqGetObject(remote); ok {
+			return f.newObjectWithInfo(ctx, remote, info)
+		}
+	}
 	return f.newObjectWithInfo(ctx, remote, nil)
 }
 
@@ -1690,6 +1723,71 @@ func (o *Object) MimeType(ctx context.Context) string {
 	return o.mimeType
 }
 
+var commandHelp = []fs.CommandHelp{{
+	Name:  "refresh",
+	Short: "Force a repopulate of the bigquery_table listing cache",
+	Long: `Runs one recursive BigQuery inventory query for the remote's bucket and
+atomically swaps the bbolt listing cache to the new snapshot. Ignores
+bigquery_cache_max_age and the failure cooldown. Intended for a cron job after
+the Storage Insights inventory updates:
+
+    rclone backend refresh gcs-bq:bucket
+
+Against a running mount (which holds the cache file's exclusive lock), use the
+remote control API instead. Backend commands are authenticated, so the mount
+needs --rc together with either --rc-no-auth or --rc-user/--rc-pass:
+
+    rclone rc backend/command command=refresh fs=gcs-bq:bucket
+
+The fs argument must match the remote string the mount opened, so that rclone
+reuses the running instance rather than opening a second one (which would fail
+on the cache file's lock).
+
+Fails if the query errors, times out (bigquery_timeout), or returns zero rows -
+in all cases the previous snapshot is kept and served.`,
+}}
+
+// Command the backend to run a named command
+//
+// The command run is name
+// args may be used to read arguments from
+// opts may be used to read optional arguments from
+//
+// The result should be capable of being JSON encoded
+// If it is a string or a []string it will be shown to the user
+// otherwise it will be JSON encoded and shown to the user like that
+func (f *Fs) Command(ctx context.Context, name string, arg []string, opt map[string]string) (any, error) {
+	switch name {
+	case "refresh":
+		if f.bqQuery == nil {
+			return nil, errors.New("refresh requires bigquery_table to be set")
+		}
+		if f.rootBucket == "" {
+			return nil, errors.New("refresh needs a bucket, e.g. remote:bucket")
+		}
+		start := time.Now()
+		if err := f.bqRefresh(ctx, f.rootBucket, true); err != nil {
+			return nil, err
+		}
+		gen := f.bqGen(f.rootBucket)
+		var objects int
+		_ = f.bqDB.View(func(tx *bolt.Tx) error {
+			if data := tx.Bucket(bqDataBucket(f.rootBucket, gen)); data != nil {
+				objects = data.Stats().KeyN
+			}
+			return nil
+		})
+		return map[string]any{
+			"bucket":     f.rootBucket,
+			"generation": gen,
+			"objects":    objects,
+			"duration":   time.Since(start).String(),
+		}, nil
+	default:
+		return nil, fs.ErrorCommandNotFound
+	}
+}
+
 // Check the interfaces are satisfied
 var (
 	_ fs.Fs          = &Fs{}
@@ -1697,6 +1795,7 @@ var (
 	_ fs.PutStreamer = &Fs{}
 	_ fs.ListRer     = &Fs{}
 	_ fs.ListPer     = &Fs{}
+	_ fs.Commander   = &Fs{}
 	_ fs.Object      = &Object{}
 	_ fs.MimeTyper   = &Object{}
 )

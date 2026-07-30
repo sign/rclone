@@ -36,10 +36,15 @@ func TestBQListQuery(t *testing.T) {
 	f.opt.BigQueryTable = "proj.ds.tbl"
 
 	rec, params := f.bqListQuery("buck", "photos/", true)
-	for _, want := range []string{"FROM `proj.ds.tbl`", "STARTS_WITH(name, @dir)", "TO_BASE64(FROM_HEX(md5Hash))"} {
+	for _, want := range []string{"FROM `proj.ds.tbl`", "STARTS_WITH(name, @dir)", "TO_BASE64(FROM_HEX(md5Hash))", "QUALIFY ROW_NUMBER() OVER (PARTITION BY name ORDER BY snapshotTime DESC) = 1"} {
 		if !strings.Contains(rec, want) {
 			t.Errorf("recursive query missing %q:\n%s", want, rec)
 		}
+	}
+	// a global sort runs on a single BigQuery worker and multiplied the job
+	// time ~8x in production - the newest-per-name dedup must stay a QUALIFY
+	if strings.Contains(rec, "ORDER BY name,") {
+		t.Errorf("recursive query reintroduced a global ORDER BY:\n%s", rec)
 	}
 	if len(params) != 2 || params[0].ParameterValue.Value != "buck" || params[1].ParameterValue.Value != "photos/" {
 		t.Errorf("unexpected params: %+v", params)

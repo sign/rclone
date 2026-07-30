@@ -13,17 +13,34 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync/atomic"
+	"time"
 
 	"github.com/rclone/rclone/fs"
+	"golang.org/x/sync/errgroup"
 	bigquery "google.golang.org/api/bigquery/v2"
 	storage "google.golang.org/api/storage/v1"
 )
 
-// bqPageSize is the row count requested per BigQuery results page. Deliberately
-// large: getQueryResults caps each response at ~10MB and returns a pageToken for
-// the rest, so a high value just minimises round-trips (a flat 100k-object
-// directory then needs a handful of pages instead of ~100 at 1000/page).
-const bqPageSize = 100000
+// bqPageSize is the row count requested per BigQuery results page and the
+// parallel download's chunk size. getQueryResults caps each response at ~10MB,
+// which is ~87k rows of this inventory's row width - asking for more than the
+// cap made every chunk cost TWO requests (a capped big page plus a 4-22s tail
+// for the remainder; ~93 wasted requests on a 9.26M-row corpus). 80k stays
+// under the cap so a chunk is one request; the within-chunk short-page loop
+// remains the safety net if wider rows ever push the cap below this.
+const bqPageSize = 80000
+
+// bqFetchConcurrency is how many getQueryResults pages are fetched in parallel
+// once the job is complete (random access via StartIndex). Parallelism is what
+// made the download usable at all - chained serially through pageTokens it ran
+// ~47min for a 9.26M-row corpus - but the result server caps per-job
+// throughput at ~17-18k rows/s, so past this point extra workers only inflate
+// per-request latency: 16 workers measured the same total time as 8 (~8m40s)
+// with double the connection pressure and transient memory. ponytail: fixed at
+// 8 (~150MB of row data); getting below that ceiling needs EXPORT DATA to GCS
+// or the Storage Read API, not a bigger number here.
+const bqFetchConcurrency = 8
 
 // bqTableRe guards the table reference before it is interpolated into SQL (BigQuery
 // can't bind table names as query parameters). project ids allow dashes; dataset
@@ -87,9 +104,17 @@ func (f *Fs) bqListQuery(bucketName, directory string, recurse bool) (string, []
 	const md5 = "TO_BASE64(FROM_HEX(md5Hash))" // Storage Insights stores md5Hash as hex; setMetaData wants base64
 
 	if recurse {
+		// QUALIFY keeps exactly one row per name - the newest capture - so a
+		// changed object can't cache stale metadata and older duplicates are
+		// never transferred. Deliberately a partitioned window and not a global
+		// ORDER BY: ORDER BY without LIMIT runs on a single BigQuery worker and
+		// multiplied the job time ~8x in production. And not a MAX(snapshotTime)
+		// pin: snapshotTime is per-object (an unchanged file keeps its old one),
+		// so pinning would drop every file unchanged since the last report.
 		sql := fmt.Sprintf(
 			"SELECT name, size, %s AS md5Hash, %s AS updated "+
-				"FROM `%s` WHERE bucket = @bucket AND STARTS_WITH(name, @dir)",
+				"FROM `%s` WHERE bucket = @bucket AND STARTS_WITH(name, @dir) "+
+				"QUALIFY ROW_NUMBER() OVER (PARTITION BY name ORDER BY snapshotTime DESC) = 1",
 			md5, ts, tbl)
 		return sql, params
 	}
@@ -139,6 +164,13 @@ func (f *Fs) bqQueryRows(ctx context.Context, bucketName, directory string, recu
 	if !recurse || directory != f.bqRemoteRoot() {
 		return fmt.Errorf("googlecloudstorage: internal error: a BigQuery listing query must be a root recursive populate, got directory=%q recurse=%v", directory, recurse)
 	}
+	// bound the whole populate (job + result pagination) so a slow query can't
+	// hold bqPopMu forever; the old snapshot keeps being served on timeout
+	if t := time.Duration(f.opt.BigQueryTimeout); t > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, t)
+		defer cancel()
+	}
 	fs.Infof(f, "BigQuery listing cache: running BigQuery query to populate %q (dir=%q, recurse=%v)", bucketName, directory, recurse)
 	sql, params := f.bqListQuery(bucketName, directory, recurse)
 	useLegacy := false
@@ -150,73 +182,180 @@ func (f *Fs) bqQueryRows(ctx context.Context, bucketName, directory string, recu
 		MaxResults:      bqPageSize,
 	}
 
+	// run the query and poll to completion; the completion response carries the
+	// first page of results inline plus the total row count
 	var (
 		jobRef    *bigquery.JobReference
 		complete  bool
-		rows      []*bigquery.TableRow
-		pageToken string
-		started   bool
+		firstRows []*bigquery.TableRow
+		totalRows uint64
 	)
-	for {
-		if !started {
-			// run the query (synchronous; first page comes back inline)
-			var resp *bigquery.QueryResponse
-			if err := f.pacer.Call(func() (bool, error) {
-				var err error
-				resp, err = f.bqSvc.Jobs.Query(f.bqProject, req).Context(ctx).Do()
-				return shouldRetry(ctx, err)
-			}); err != nil {
-				return err
-			}
-			jobRef, complete, rows, pageToken = resp.JobReference, resp.JobComplete, resp.Rows, resp.PageToken
-			started = true
-		} else {
-			// poll a still-running job, or fetch the next page of a complete one
-			var resp *bigquery.GetQueryResultsResponse
-			if err := f.pacer.Call(func() (bool, error) {
-				call := f.bqSvc.Jobs.GetQueryResults(jobRef.ProjectId, jobRef.JobId).MaxResults(bqPageSize).Context(ctx)
-				if jobRef.Location != "" {
-					call = call.Location(jobRef.Location) // required for non-US/EU datasets
-				}
-				if pageToken != "" {
-					call = call.PageToken(pageToken)
-				}
-				var err error
-				resp, err = call.Do()
-				return shouldRetry(ctx, err)
-			}); err != nil {
-				return err
-			}
-			complete, rows, pageToken = resp.JobComplete, resp.Rows, resp.PageToken
+	start := time.Now()
+	{
+		var resp *bigquery.QueryResponse
+		if err := f.pacer.Call(func() (bool, error) {
+			var err error
+			resp, err = f.bqSvc.Jobs.Query(f.bqProject, req).Context(ctx).Do()
+			return shouldRetry(ctx, err)
+		}); err != nil {
+			return err
 		}
-
-		if !complete {
-			continue // job still running; poll again (the pacer paces this)
+		jobRef, complete, firstRows, totalRows = resp.JobReference, resp.JobComplete, resp.Rows, resp.TotalRows
+	}
+	for !complete {
+		// job still running; the pacer only sleeps after retryable errors, so
+		// back off here instead of hammering getQueryResults in a tight loop
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(time.Second):
 		}
-
-		for _, row := range rows {
-			if len(row.F) < 4 {
-				continue
+		var resp *bigquery.GetQueryResultsResponse
+		if err := f.pacer.Call(func() (bool, error) {
+			call := f.bqSvc.Jobs.GetQueryResults(jobRef.ProjectId, jobRef.JobId).MaxResults(bqPageSize).Context(ctx)
+			if jobRef.Location != "" {
+				call = call.Location(jobRef.Location) // required for non-US/EU datasets
 			}
-			name := cellString(row.F[0])
-			if name == "" {
-				continue
-			}
-			if err := fn(bqRow{
-				name:    name,
-				size:    cellString(row.F[1]),
-				md5:     cellString(row.F[2]),
-				updated: cellString(row.F[3]),
-			}); err != nil {
-				return err
-			}
+			var err error
+			resp, err = call.Do()
+			return shouldRetry(ctx, err)
+		}); err != nil {
+			return err
 		}
+		complete, firstRows, totalRows = resp.JobComplete, resp.Rows, resp.TotalRows
+	}
+	// marks where query execution ends and result download begins - the
+	// download of ~10MB getQueryResults pages usually dominates
+	fs.Infof(f, "BigQuery listing cache: query finished in %v, downloading %d rows", time.Since(start).Round(time.Millisecond), totalRows)
 
-		if pageToken == "" {
-			break
+	dlStart := time.Now()
+	for _, r := range parseBQRows(firstRows) {
+		if err := fn(r); err != nil {
+			return err
 		}
 	}
+	// row offsets below count raw result rows (including any skipped by
+	// parseBQRows), so chunking uses len(firstRows), not the parsed count
+	off := uint64(len(firstRows))
+	if off > 0 {
+		fs.Infof(f, "BigQuery listing cache: fetched %d rows (%d/%d) inline", len(firstRows), off, totalRows)
+	}
+	if off >= totalRows {
+		return nil
+	}
+
+	// fan out: getQueryResults supports random access by row index (StartIndex),
+	// so the remaining pages are fetched and parsed by bqFetchConcurrency
+	// workers instead of being chained serially through pageTokens. This
+	// goroutine stays the sole caller of fn - the bqRowSource emit contract is
+	// single-threaded - by draining the workers' pages channel.
+	fctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	g, gctx := errgroup.WithContext(fctx)
+	pages := make(chan []bqRow, bqFetchConcurrency)
+
+	const chunkSize = uint64(bqPageSize)
+	numChunks := (totalRows - off + chunkSize - 1) / chunkSize
+	var nextChunk, fetched atomic.Uint64
+	for w := 0; w < bqFetchConcurrency; w++ {
+		g.Go(func() error {
+			for {
+				ci := nextChunk.Add(1) - 1
+				if ci >= numChunks {
+					return nil
+				}
+				cur := off + ci*chunkSize
+				end := min(cur+chunkSize, totalRows)
+				for cur < end {
+					pageStart := time.Now()
+					var resp *bigquery.GetQueryResultsResponse
+					if err := f.pacer.Call(func() (bool, error) {
+						call := f.bqSvc.Jobs.GetQueryResults(jobRef.ProjectId, jobRef.JobId).
+							StartIndex(cur).MaxResults(int64(end - cur)).Context(gctx)
+						if jobRef.Location != "" {
+							call = call.Location(jobRef.Location)
+						}
+						var err error
+						resp, err = call.Do()
+						return shouldRetry(gctx, err)
+					}); err != nil {
+						return err
+					}
+					if len(resp.Rows) == 0 {
+						// guards against an infinite loop if the server ever returns
+						// an empty page short of the advertised total
+						return fmt.Errorf("googlecloudstorage: getQueryResults returned no rows at index %d of %d", cur, totalRows)
+					}
+					select {
+					case pages <- parseBQRows(resp.Rows):
+					case <-gctx.Done():
+						return gctx.Err()
+					}
+					cur += uint64(len(resp.Rows))
+					fs.Infof(f, "BigQuery listing cache: fetched %d rows (%d/%d) in %v",
+						len(resp.Rows), off+fetched.Add(uint64(len(resp.Rows))), totalRows, time.Since(pageStart).Round(time.Millisecond))
+				}
+			}
+		})
+	}
+	go func() {
+		_ = g.Wait() // the g.Wait below surfaces the error; this one just orders the close
+		close(pages)
+	}()
+
+	var emitErr error
+	for page := range pages {
+		if emitErr != nil {
+			continue // keep draining so no worker blocks on a send after an emit failure
+		}
+		for _, r := range page {
+			if emitErr = fn(r); emitErr != nil {
+				cancel() // stop the fetch fan-out
+				break
+			}
+		}
+	}
+	if err := g.Wait(); err != nil && emitErr == nil {
+		return err
+	}
+	if emitErr != nil {
+		return emitErr
+	}
+	fs.Infof(f, "BigQuery listing cache: downloaded %d rows in %v", totalRows, time.Since(dlStart).Round(time.Millisecond))
 	return nil
+}
+
+// parseBQRows converts raw REST result rows to bqRows, skipping malformed or
+// nameless rows the same way the serial emit loop always has.
+func parseBQRows(rows []*bigquery.TableRow) []bqRow {
+	out := make([]bqRow, 0, len(rows))
+	for _, row := range rows {
+		if len(row.F) < 4 {
+			continue
+		}
+		name := cellString(row.F[0])
+		if name == "" {
+			continue
+		}
+		out = append(out, bqRow{
+			name:    name,
+			size:    cellString(row.F[1]),
+			md5:     cellString(row.F[2]),
+			updated: cellString(row.F[3]),
+		})
+	}
+	return out
+}
+
+// bqRowObject builds the storage.Object a cached inventory row stands for, in
+// the exact shape setMetaData expects. Shared by listing emission and the
+// NewObject point lookup.
+func bqRowObject(r bqRow) *storage.Object {
+	object := &storage.Object{Name: r.name}
+	object.Size, _ = strconv.ParseUint(r.size, 10, 64)
+	object.Md5Hash = r.md5 // base64 (converted from the inventory's hex in SQL), as setMetaData expects
+	object.Updated = r.updated
+	return object
 }
 
 // emitBQRow maps one raw inventory row through objectRemote/setMetaData exactly
@@ -230,9 +369,7 @@ func (f *Fs) emitBQRow(r bqRow, directory, prefix, bucketName string, addBucket 
 	}
 	object := &storage.Object{Name: r.name}
 	if !isDirectory {
-		object.Size, _ = strconv.ParseUint(r.size, 10, 64)
-		object.Md5Hash = r.md5 // base64 (converted from the inventory's hex in SQL), as setMetaData expects
-		object.Updated = r.updated
+		object = bqRowObject(r)
 	}
 	if err := fn(remote, object, isDirectory); err != nil {
 		return false, err

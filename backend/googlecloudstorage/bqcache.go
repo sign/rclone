@@ -2,10 +2,11 @@ package googlecloudstorage
 
 // bbolt listing cache for bigquery_table mode. It turns the per-directory
 // BigQuery query storm (one job per FUSE readdir during a tree walk) into at
-// most one job per refresh: a recursive list at the remote root - e.g. a
-// scheduled "rclone rc vfs/refresh recursive=true" - repopulates the whole cache
-// in a single query, and every other list is served from bbolt with no BigQuery
-// traffic. The read path never issues a per-directory query.
+// most one job per refresh: every list is served from bbolt, and the cache is
+// repopulated by a single recursive root query - in the background when a
+// previous snapshot exists (lists keep serving the old snapshot meanwhile),
+// synchronously only when the cache is cold, or on demand via the "refresh"
+// backend command. The read path never issues a per-directory query.
 //
 // On-disk layout (one file per remote):
 //
@@ -30,6 +31,7 @@ import (
 
 	"github.com/rclone/rclone/fs"
 	bolt "go.etcd.io/bbolt"
+	storage "google.golang.org/api/storage/v1"
 )
 
 const (
@@ -87,7 +89,11 @@ func openBQCache(path string) (*bolt.DB, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
 		return nil, fmt.Errorf("bigquery_cache_db: %w", err)
 	}
-	db, err := bolt.Open(path, 0600, &bolt.Options{Timeout: 5 * time.Second})
+	// InitialMmapSize reserves virtual address space (not RAM), so populate-driven
+	// file growth rarely forces a remap - a remap blocks every concurrent reader.
+	// ponytail: 1GiB covers the current corpus with two generations coexisting;
+	// raise if the DB file outgrows it.
+	db, err := bolt.Open(path, 0600, &bolt.Options{Timeout: 5 * time.Second, InitialMmapSize: 1 << 30})
 	if err != nil {
 		return nil, fmt.Errorf("bigquery_cache_db %q (must be a local file owned by a single rclone process): %w", path, err)
 	}
@@ -162,81 +168,115 @@ func (f *Fs) cacheRootSource(ctx context.Context, bucketName string) bqRowSource
 	}
 }
 
-// listBQ serves a list from the bbolt cache (bigquery_table always runs with the
-// cache). A recursive list at the remote root is the populate (unconditional -
-// this is the scheduled/boot refresh); every other list serves from bbolt,
-// triggering one full-root populate first if the cache is cold or stale. Nothing
-// here ever issues a per-directory query.
-func (f *Fs) listBQ(ctx context.Context, bucketName, directory, prefix string, addBucket, recurse bool, fn listFn) error {
-	if recurse && directory == f.bqRemoteRoot() {
-		f.bqPopMu.Lock()
-		defer f.bqPopMu.Unlock()
-		return f.bqPopulate(ctx, bucketName, directory, prefix, addBucket, fn, f.cacheRootSource(ctx, bucketName))
-	}
+// bqGen returns the current generation for bucketName, 0 if none populated.
+func (f *Fs) bqGen(bucketName string) uint64 {
+	var gen uint64
+	_ = f.bqDB.View(func(tx *bolt.Tx) error {
+		gen = bqReadGen(tx, bucketName)
+		return nil
+	})
+	return gen
+}
 
+// listBQ serves a list from the bbolt cache (bigquery_table always runs with the
+// cache). Fresh cache: bbolt only, no BigQuery traffic. Stale with a previous
+// snapshot: serve the old snapshot immediately and refresh in the background
+// (single-flight). Cold (nothing populated yet): block on one synchronous
+// populate - there is nothing to serve. Nothing here ever issues a
+// per-directory query.
+func (f *Fs) listBQ(ctx context.Context, bucketName, directory, prefix string, addBucket, recurse bool, fn listFn) error {
 	stale, err := f.bqCacheStale(bucketName)
 	if err != nil {
 		return err
 	}
 	if stale {
-		f.bqPopMu.Lock()
-		// re-check under the lock: a concurrent reader may have just populated
-		stale, err = f.bqCacheStale(bucketName)
-
-		var gen uint64
-		_ = f.bqDB.View(func(tx *bolt.Tx) error {
-			gen = bqReadGen(tx, bucketName)
-			return nil
-		})
-		// serve stale (skip the query) if we already have a snapshot and a populate
-		// just failed - don't re-hammer BigQuery on every list during an outage
-		coolingDown := gen != 0 && !f.bqLastPopFail.IsZero() && time.Since(f.bqLastPopFail) < bqPopRetryCooldown
-
-		if err == nil && stale && !coolingDown {
-			// bootstrap populates the whole remote root (fn nil = don't emit; we
-			// serve the requested slice from the fresh cache below)
-			err = f.bqPopulate(ctx, bucketName, f.bqRemoteRoot(), "", false, nil, f.cacheRootSource(ctx, bucketName))
-
-			// did the populate actually refresh? a zero-row query keeps the old
-			// (stale) snapshot without advancing the generation - like a failure, it
-			// leaves the cache stale, so it must back off too or every later list
-			// re-fires a full-root query during a transient empty/broken inventory.
-			var newGen uint64
-			_ = f.bqDB.View(func(tx *bolt.Tx) error {
-				newGen = bqReadGen(tx, bucketName)
-				return nil
-			})
-			switch {
-			case err == nil && newGen != gen:
-				f.bqLastPopFail = time.Time{} // refreshed to a new generation
-			case gen != 0:
-				// failed, or returned zero rows: serve the stale snapshot and back
-				// off. The on-disk timestamp is untouched, so we repopulate the
-				// moment a real snapshot returns past the cooldown.
-				f.bqLastPopFail = time.Now()
-				if err != nil {
-					fs.Logf(f, "BigQuery listing cache: repopulate failed for %q, serving stale cache: %v", bucketName, err)
-				} else {
-					fs.Logf(f, "BigQuery listing cache: repopulate returned no rows for %q, serving stale cache", bucketName)
-				}
-				err = nil
+		if f.bqGen(bucketName) == 0 {
+			if err := f.bqRefresh(ctx, bucketName, false); err != nil {
+				return err // cold cache, nothing to serve
 			}
-		}
-		f.bqPopMu.Unlock()
-		if err != nil {
-			return err // cold cache (gen 0), nothing to serve
+		} else {
+			f.bqKickRefresh(bucketName)
 		}
 	}
 	return f.bqServe(ctx, bucketName, directory, prefix, addBucket, recurse, fn)
 }
 
+// bqRefresh runs one synchronous populate under bqPopMu. It is the only
+// blocking entry point: the cold-cache list path (force=false) and the
+// "refresh" backend command (force=true, which bypasses the staleness re-check
+// and additionally reports a zero-row query as an error, so a cron caller sees
+// a failed refresh instead of a silently retained old snapshot).
+func (f *Fs) bqRefresh(ctx context.Context, bucketName string, force bool) error {
+	f.bqPopMu.Lock()
+	defer f.bqPopMu.Unlock()
+	if !force {
+		// re-check under the lock: a racer may have populated while we waited
+		stale, err := f.bqCacheStale(bucketName)
+		if err != nil || !stale {
+			return err
+		}
+	}
+	advanced, err := f.bqPopulateLocked(ctx, bucketName)
+	if err != nil {
+		return err
+	}
+	if force && !advanced {
+		return fmt.Errorf("refresh: BigQuery returned no rows, kept existing cache for %q (gen %d)", bucketName, f.bqGen(bucketName))
+	}
+	return nil
+}
+
+// bqKickRefresh starts a background populate for a stale-but-servable cache.
+// ponytail: bqPopMu.TryLock IS the single-flight - losing the race means a
+// populate is already running (or starting), so there is nothing to kick.
+func (f *Fs) bqKickRefresh(bucketName string) {
+	if !f.bqPopMu.TryLock() {
+		return
+	}
+	// re-check under the lock, and honor the failure cooldown before spawning:
+	// a stat storm during a BigQuery outage must start zero goroutines
+	stale, err := f.bqCacheStale(bucketName)
+	cooling := !f.bqLastPopFail.IsZero() && time.Since(f.bqLastPopFail) < bqPopRetryCooldown
+	if err != nil || !stale || cooling {
+		f.bqPopMu.Unlock()
+		return
+	}
+	f.bqWG.Add(1)
+	go func() {
+		defer f.bqWG.Done()
+		defer f.bqPopMu.Unlock()
+		if _, err := f.bqPopulateLocked(f.bqCtx, bucketName); err != nil {
+			fs.Errorf(f, "BigQuery listing cache: background refresh of %q failed, serving stale cache: %v", bucketName, err)
+		}
+	}()
+}
+
+// bqPopulateLocked runs one populate and owns the bqLastPopFail bookkeeping.
+// advanced reports whether a new generation was flipped in (a zero-row query
+// keeps the old one). Caller must hold bqPopMu.
+func (f *Fs) bqPopulateLocked(ctx context.Context, bucketName string) (advanced bool, err error) {
+	gen := f.bqGen(bucketName)
+	err = f.bqPopulate(bucketName, f.cacheRootSource(ctx, bucketName))
+	advanced = f.bqGen(bucketName) != gen
+	switch {
+	case err == nil && advanced:
+		f.bqLastPopFail = time.Time{} // refreshed to a new generation
+	case gen != 0:
+		// failed, or returned zero rows: the old snapshot keeps being served, so
+		// back off - don't re-fire a full-root query on every list during an
+		// outage. The on-disk timestamp is untouched, so the first list past the
+		// cooldown repopulates the moment a real snapshot returns.
+		f.bqLastPopFail = time.Now()
+	}
+	return advanced, err
+}
+
 // bqPopulate rebuilds bucketName's cache from one recursive BigQuery query over
-// directory (the remote root) using generation-swap. On any error the flip is
-// skipped, so readers keep seeing the previous complete snapshot. If fn is
-// non-nil each row is also emitted, so the scheduled refresh both repopulates
-// the cache and feeds its caller from the same stream. Rows come from src
-// (BigQuery in production). Caller must hold bqPopMu.
-func (f *Fs) bqPopulate(ctx context.Context, bucketName, directory, prefix string, addBucket bool, fn listFn, src bqRowSource) error {
+// the remote root using generation-swap. On any error the flip is skipped, so
+// readers keep seeing the previous complete snapshot. Rows come from src
+// (BigQuery in production). Caller must hold bqPopMu; callers serve the
+// requested slice from bbolt afterwards, populate never emits entries itself.
+func (f *Fs) bqPopulate(bucketName string, src bqRowSource) error {
 	// pick the next generation and start it empty (clears any aborted attempt)
 	var newGen uint64
 	if err := f.bqDB.Update(func(tx *bolt.Tx) error {
@@ -251,46 +291,63 @@ func (f *Fs) bqPopulate(ctx context.Context, bucketName, directory, prefix strin
 		return err
 	}
 
-	pending := make([]bqRow, 0, bqCacheBatch)
+	// pipeline: this goroutine fetches/parses result pages while a writer
+	// goroutine runs the batched bbolt txns, so the network never waits on an
+	// fsync and vice versa. The small channel buffer bounds memory to a couple
+	// of in-flight batches.
+	batches := make(chan []bqRow, 2)
+	done := make(chan struct{})
+	stop := make(chan struct{}) // closed by the writer on its first error
+	var writeErr error
 	written := 0
-	flush := func() error {
-		if len(pending) == 0 {
-			return nil
-		}
-		err := f.bqDB.Update(func(tx *bolt.Tx) error {
-			b := tx.Bucket(bqDataBucket(bucketName, newGen))
-			for _, r := range pending {
-				if err := b.Put([]byte(r.name), bqEncodeValue(r)); err != nil {
-					return err
-				}
+	go func() {
+		defer close(done)
+		for batch := range batches {
+			if writeErr != nil {
+				continue // already failed; keep draining so the producer never blocks
 			}
-			return nil
-		})
-		if err != nil {
-			return err
+			writeErr = f.bqDB.Update(func(tx *bolt.Tx) error {
+				b := tx.Bucket(bqDataBucket(bucketName, newGen))
+				for _, r := range batch {
+					if err := b.Put([]byte(r.name), bqEncodeValue(r)); err != nil {
+						return err
+					}
+				}
+				return nil
+			})
+			if writeErr != nil {
+				close(stop)
+				continue
+			}
+			written += len(batch)
 		}
-		written += len(pending)
-		pending = pending[:0]
-		return nil
-	}
+	}()
 
+	pending := make([]bqRow, 0, bqCacheBatch)
 	err := src(func(r bqRow) error {
 		pending = append(pending, r)
 		if len(pending) >= bqCacheBatch {
-			if err := flush(); err != nil {
-				return err
+			select {
+			case batches <- pending:
+				pending = make([]bqRow, 0, bqCacheBatch)
+			case <-stop:
+				return writeErr // safe: close(stop) is ordered after writeErr was set
 			}
-		}
-		if fn != nil {
-			_, err := f.emitBQRow(r, directory, prefix, bucketName, addBucket, fn)
-			return err
 		}
 		return nil
 	})
-	if err != nil {
-		return err
+	if err == nil && len(pending) > 0 {
+		select {
+		case batches <- pending:
+		case <-stop:
+		}
 	}
-	if err := flush(); err != nil {
+	close(batches)
+	<-done
+	if err == nil {
+		err = writeErr
+	}
+	if err != nil {
 		return err
 	}
 
@@ -303,12 +360,6 @@ func (f *Fs) bqPopulate(ctx context.Context, bucketName, directory, prefix strin
 			return tx.DeleteBucket(bqDataBucket(bucketName, newGen))
 		})
 		fs.Infof(f, "BigQuery listing cache: query returned no rows, kept existing cache for %q", bucketName)
-		if fn != nil {
-			// a recursive-root refresh caller still needs its entries: serve them
-			// from the retained generation rather than reporting an empty tree
-			// (bqServe reports not-found only if the cache is genuinely cold)
-			return f.bqServe(ctx, bucketName, directory, prefix, addBucket, true, fn)
-		}
 		return nil
 	}
 	fs.Infof(f, "BigQuery listing cache: populated %q with %d objects (gen %d)", bucketName, written, newGen)
@@ -404,4 +455,31 @@ func (f *Fs) bqServe(ctx context.Context, bucketName, directory, prefix string, 
 		return f.bqNotFound(ctx, bucketName, directory)
 	}
 	return nil
+}
+
+// bqGetObject answers a single-object stat from the current cache generation.
+// ok=false (cold cache, or key absent - e.g. an object newer than the
+// inventory) means the caller falls back to a real Objects.Get. Never queries
+// BigQuery and never triggers a populate: a stat storm must not spend money.
+// No staleness check either - listings serve these same rows at the same age.
+func (f *Fs) bqGetObject(remote string) (info *storage.Object, ok bool) {
+	bucketName, bucketPath := f.split(remote) // bucketPath is Enc-encoded, matching the stored key
+	if bucketName == "" || bucketPath == "" {
+		return nil, false
+	}
+	_ = f.bqDB.View(func(tx *bolt.Tx) error {
+		gen := bqReadGen(tx, bucketName)
+		if gen == 0 {
+			return nil
+		}
+		data := tx.Bucket(bqDataBucket(bucketName, gen))
+		if data == nil {
+			return nil
+		}
+		if v := data.Get([]byte(bucketPath)); v != nil {
+			info, ok = bqRowObject(bqDecodeValue(bucketPath, v)), true
+		}
+		return nil
+	})
+	return info, ok
 }

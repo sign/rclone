@@ -88,6 +88,23 @@ rclone mount overlay: /mnt/point \
   not change the (origin-backed) listing, which is the desired behaviour.
 - `--no-modtime` — modtime comes from the list remote anyway.
 
+## Performance
+
+- **Cold open = one `HeadObject` + one `GetObject`** against the read remote (the HEAD
+  resolves the read object; with Sippy it proxies origin metadata so it succeeds for
+  not-yet-migrated keys). Re-opens of the same in-memory object skip the HEAD. The HEAD
+  runs outside any lock, so concurrent opens of different (or the same) files scale.
+- **Do NOT set `no_head_object = true` on the read remote** to skip that HEAD. The s3
+  backend then leaves the object size at 0, and its `Open` runs
+  `fs.FixRangeOption(options, 0)` which **silently strips all Range options** — every
+  ranged read (which is how the VFS reads) fetches from offset 0 and returns wrong data.
+- **Stat (`NewObject`) is served by the list remote.** With a `gcs` list remote in
+  `bigquery_table` mode, stats are answered from the local bbolt cache with no network
+  call; refresh the cache after inventory updates with
+  `rclone rc backend/command command=refresh fs=gcs:<bucket>` against the running mount
+  (needs `--rc`), or `rclone backend refresh gcs:<bucket>` when nothing holds the cache
+  file lock.
+
 ## Behaviour / limitations
 
 - **Read-only.** All mutations return `permission denied`.

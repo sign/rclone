@@ -25,6 +25,7 @@ import (
 
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/config/configmap"
+	"github.com/rclone/rclone/fs/hash"
 )
 
 // queryCall records what a fired BigQuery query targeted.
@@ -90,6 +91,7 @@ func newCountFs(t *testing.T, fixture []bqRow, cacheOn bool) (*Fs, *queryRecorde
 	f := &Fs{}
 	f.setRoot("buck") // rootBucket="buck", rootDirectory="" => remote root is ""
 	f.opt.BigQueryCacheMaxAge = fs.Duration(48 * time.Hour)
+	f.bqCtx, f.bqCancel = context.WithCancel(context.Background())
 	rec := &queryRecorder{fixture: fixture}
 	f.bqQuery = rec.query
 	f.bqNotFound = func(ctx context.Context, bucketName, directory string) error {
@@ -103,6 +105,12 @@ func newCountFs(t *testing.T, fixture []bqRow, cacheOn bool) (*Fs, *queryRecorde
 		t.Cleanup(func() { _ = db.Close() })
 		f.bqDB = db
 	}
+	// registered last so it runs first (LIFO): drain any background populate
+	// before the cleanups above close the bbolt handle under it
+	t.Cleanup(func() {
+		f.bqCancel()
+		f.bqWG.Wait()
+	})
 	return f, rec
 }
 
@@ -211,7 +219,9 @@ func TestBQCacheCountWarmWalkNoQueries(t *testing.T) {
 	assertAllRootRecursive(t, f, rec)
 }
 
-// 4. stale cache + walk every directory => exactly 1 repopulate, not N.
+// 4. stale cache + walk every directory => exactly 1 repopulate, not N. The
+// repopulate now runs in the background (single-flight), so drain it before
+// asserting the count.
 func TestBQCacheCountStaleWalkRepopulatesOnce(t *testing.T) {
 	f, rec := newCountFs(t, countFixture, true)
 	if err := walkDir(f, "", true); err != nil { // warm: 1
@@ -223,9 +233,14 @@ func TestBQCacheCountStaleWalkRepopulatesOnce(t *testing.T) {
 			t.Fatalf("walk %q: %v", d, err)
 		}
 	}
+	f.bqWG.Wait()
 	if n := rec.count(); n != 2 {
 		t.Errorf("stale walk fired %d queries total, want 2 (1 warm + 1 repopulate, not one per dir)", n)
 	}
+	if gen := readGen(t, f, "buck"); gen != 2 {
+		t.Errorf("generation after background repopulate = %d; want 2", gen)
+	}
+	assertAllRootRecursive(t, f, rec)
 }
 
 // 5. concurrent cold reads => exactly 1 query (mutex + double-check). The gate
@@ -352,13 +367,33 @@ func TestBQCacheCountMaxAgeZeroNeverRequeries(t *testing.T) {
 	}
 }
 
-// 11. explicit recursive root refresh on a fresh cache => 1 query each and the
-// generation increments (the refresh actually refreshes, not short-circuited).
-func TestBQCacheCountExplicitRefreshAlwaysRepopulates(t *testing.T) {
+// 11a. a recursive root list is TTL-gated like any other list: on a warm cache
+// it serves from bbolt and fires NO query (this used to be an unconditional
+// repopulate - "rclone sync --fast-list" was re-querying BigQuery every run).
+func TestBQCacheCountWarmRootRecursiveNoQuery(t *testing.T) {
 	f, rec := newCountFs(t, countFixture, true)
-	for i := 1; i <= 3; i++ {
+	for i := 0; i < 3; i++ {
 		if err := walkDir(f, "", true); err != nil {
 			t.Fatal(err)
+		}
+	}
+	if n := rec.count(); n != 1 {
+		t.Errorf("3 warm recursive root lists fired %d queries; want 1 (cold populate only)", n)
+	}
+	if gen := readGen(t, f, "buck"); gen != 1 {
+		t.Errorf("generation = %d; want 1 (no re-populates)", gen)
+	}
+}
+
+// 11b. the "refresh" backend command is the explicit force: 1 query each and the
+// generation increments even on a fresh cache; failures and zero-row results are
+// reported as errors while the old snapshot is kept.
+func TestBQCommandRefreshAlwaysRepopulates(t *testing.T) {
+	f, rec := newCountFs(t, countFixture, true)
+	ctx := context.Background()
+	for i := 1; i <= 3; i++ {
+		if _, err := f.Command(ctx, "refresh", nil, nil); err != nil {
+			t.Fatalf("refresh %d: %v", i, err)
 		}
 		if n := rec.count(); n != i {
 			t.Errorf("after %d refreshes, %d queries fired; want %d", i, n, i)
@@ -366,6 +401,25 @@ func TestBQCacheCountExplicitRefreshAlwaysRepopulates(t *testing.T) {
 		if gen := readGen(t, f, "buck"); gen != uint64(i) {
 			t.Errorf("after %d refreshes, generation = %d; want %d", i, gen, i)
 		}
+	}
+
+	// a failing query surfaces as an error and keeps the old generation
+	rec.err = errors.New("boom")
+	if _, err := f.Command(ctx, "refresh", nil, nil); err == nil {
+		t.Error("refresh with failing query returned nil error")
+	}
+	if gen := readGen(t, f, "buck"); gen != 3 {
+		t.Errorf("failed refresh changed generation to %d; want 3 (kept)", gen)
+	}
+
+	// a zero-row query is also an error for the forced refresh (cron must see it)
+	rec.err = nil
+	rec.fixture = nil
+	if _, err := f.Command(ctx, "refresh", nil, nil); err == nil {
+		t.Error("refresh with empty inventory returned nil error")
+	}
+	if gen := readGen(t, f, "buck"); gen != 3 {
+		t.Errorf("empty refresh changed generation to %d; want 3 (kept)", gen)
 	}
 }
 
@@ -422,6 +476,7 @@ func TestBQCacheCountStaleSubdirRepopulatesFromRoot(t *testing.T) {
 	if err := walkDir(f, "d1/sub", false); err != nil { // single-level ls of a subdir
 		t.Fatalf("ls d1/sub: %v", err)
 	}
+	f.bqWG.Wait() // drain the background repopulate the stale ls kicked
 	calls := rec.snapshot()
 	if len(calls) != 2 {
 		t.Fatalf("fired %d queries, want 2 (1 warm + 1 stale repopulate)", len(calls))
@@ -461,7 +516,8 @@ func TestBQCachePopulateErrorDoesNotFlip(t *testing.T) {
 // 14. generation-swap is atomic under concurrent reads: while a populate is
 // mid-flight writing the next generation, a concurrent read sees the complete
 // previous snapshot (never partial/empty), and the new one only after the swap.
-// Run under -race.
+// Driven through the forced "refresh" command (a warm recursive root list no
+// longer populates). Run under -race.
 func TestBQCacheGenerationSwapAtomicUnderConcurrentReads(t *testing.T) {
 	f, rec := newCountFs(t, []bqRow{{name: "old.txt", size: "1"}}, true)
 	if err := walkDir(f, "", true); err != nil { // populate gen 1 (old.txt)
@@ -478,7 +534,7 @@ func TestBQCacheGenerationSwapAtomicUnderConcurrentReads(t *testing.T) {
 	done := make(chan struct{})
 	var popErr error
 	go func() {
-		popErr = walkDir(f, "", true) // recursive root => populate gen 2, blocks in the query
+		_, popErr = f.Command(context.Background(), "refresh", nil, nil) // populate gen 2, blocks in the query
 		close(done)
 	}()
 	<-rec.started // gen 2 is being written into its own bucket; gen 1 is still current
@@ -510,11 +566,13 @@ func TestBQCacheCountStaleServesStaleOnPopulateFailure(t *testing.T) {
 	ageCache(t, f, "buck") // now stale
 
 	// repopulate fails, but a good (stale) snapshot is on disk: the list must
-	// still succeed by serving stale, firing exactly one (failed) attempt.
+	// still succeed by serving stale, firing exactly one (failed) background
+	// attempt. Drain it so the failure is recorded before the next list.
 	rec.err = errors.New("boom")
 	if err := walkDir(f, "d1", false); err != nil {
 		t.Fatalf("stale list with failing repopulate: got %v, want nil (served stale)", err)
 	}
+	f.bqWG.Wait()
 	if n := rec.count(); n != 2 {
 		t.Fatalf("first failed repopulate fired %d queries total, want 2 (warm + 1 attempt)", n)
 	}
@@ -523,11 +581,13 @@ func TestBQCacheCountStaleServesStaleOnPopulateFailure(t *testing.T) {
 	if err := walkDir(f, "d2", false); err != nil {
 		t.Fatalf("second stale list: %v", err)
 	}
+	f.bqWG.Wait()
 	if n := rec.count(); n != 2 {
 		t.Errorf("cooldown let another attempt through: %d queries, want 2", n)
 	}
 
 	// recovery: clear the cooldown (white-box), query succeeds, cache repopulates
+	// in the background while the list itself still serves the stale snapshot
 	f.bqPopMu.Lock()
 	f.bqLastPopFail = time.Time{}
 	f.bqPopMu.Unlock()
@@ -535,6 +595,7 @@ func TestBQCacheCountStaleServesStaleOnPopulateFailure(t *testing.T) {
 	if err := walkDir(f, "d1", false); err != nil {
 		t.Fatalf("recovery list: %v", err)
 	}
+	f.bqWG.Wait()
 	if n := rec.count(); n != 3 {
 		t.Errorf("recovery fired %d queries total, want 3", n)
 	}
@@ -560,6 +621,7 @@ func TestBQCacheCountStaleEmptyRepopulateDoesNotLoop(t *testing.T) {
 	if err := walkDir(f, "d1", false); err != nil {
 		t.Fatalf("stale list with empty repopulate: %v", err)
 	}
+	f.bqWG.Wait() // drain so the zero-row outcome engages the cooldown
 	if n := rec.count(); n != 2 {
 		t.Fatalf("empty repopulate fired %d queries total, want 2 (warm + 1)", n)
 	}
@@ -573,21 +635,23 @@ func TestBQCacheCountStaleEmptyRepopulateDoesNotLoop(t *testing.T) {
 			t.Fatalf("stale list %d: %v", i, err)
 		}
 	}
+	f.bqWG.Wait()
 	if n := rec.count(); n != 2 {
 		t.Errorf("empty-inventory cooldown breached: %d queries, want 2 (no re-query loop)", n)
 	}
 }
 
-// 17 (Fix B): a recursive-root refresh whose query returns zero rows keeps the
-// existing cache AND still serves the caller its retained entries (not an
-// empty/not-found tree), leaving the generation unchanged.
+// 17 (Fix B): a stale recursive-root list whose repopulate returns zero rows
+// keeps the existing cache AND still serves the caller its retained entries
+// (not an empty/not-found tree), leaving the generation unchanged.
 func TestBQCacheEmptyRefreshServesRetainedCache(t *testing.T) {
 	f, rec := newCountFs(t, countFixture, true)
 	if err := walkDir(f, "", true); err != nil { // warm: gen 1
 		t.Fatal(err)
 	}
+	ageCache(t, f, "buck") // stale, so the next list actually kicks a repopulate
 
-	// the next recursive-root refresh returns nothing (inventory mid-regeneration)
+	// the repopulate returns nothing (inventory mid-regeneration)
 	rec.fixture = nil
 	var names []string
 	err := f.list(context.Background(), "buck", "", "", false, true,
@@ -601,7 +665,171 @@ func TestBQCacheEmptyRefreshServesRetainedCache(t *testing.T) {
 	if len(names) == 0 {
 		t.Error("empty refresh served no entries; want the retained snapshot")
 	}
+	f.bqWG.Wait()
 	if gen := readGen(t, f, "buck"); gen != 1 {
 		t.Errorf("empty refresh changed generation to %d; want 1 (kept)", gen)
+	}
+}
+
+// listNames drives the full list path (staleness check + refresh kick) and
+// returns what it served, unlike collect which reads bqServe directly.
+func listNames(t *testing.T, f *Fs, dir string, recurse bool) []string {
+	t.Helper()
+	var names []string
+	err := f.list(context.Background(), "buck", dir, "", false, recurse,
+		func(remote string, _ *storage.Object, _ bool) error {
+			names = append(names, remote)
+			return nil
+		})
+	if err != nil {
+		t.Fatalf("list %q: %v", dir, err)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// 19. THE SIGN-726 regression test: a stale list must return the old snapshot
+// while the repopulate is still in flight - the gate stays closed until after
+// the list has answered, so a blocking refresh would deadlock this test.
+func TestBQCacheStaleServesOldGenNonBlocking(t *testing.T) {
+	f, rec := newCountFs(t, []bqRow{{name: "old.txt", size: "1"}}, true)
+	if err := walkDir(f, "", true); err != nil { // warm: gen 1
+		t.Fatal(err)
+	}
+	ageCache(t, f, "buck")
+
+	rec.fixture = []bqRow{{name: "new.txt", size: "1"}}
+	rec.gate = true
+	rec.started = make(chan struct{}, 1)
+	rec.release = make(chan struct{})
+
+	// this list kicks the background repopulate and must answer from gen 1
+	// immediately, while the query is blocked on the gate
+	if got := listNames(t, f, "", false); !reflect.DeepEqual(got, []string{"old.txt"}) {
+		t.Errorf("stale list served %v; want [old.txt] (old snapshot)", got)
+	}
+	<-rec.started // the background populate is provably mid-flight
+
+	// further lists keep serving the old snapshot without a second query
+	if got := listNames(t, f, "", false); !reflect.DeepEqual(got, []string{"old.txt"}) {
+		t.Errorf("list during refresh served %v; want [old.txt]", got)
+	}
+	if n := rec.count(); n != 2 {
+		t.Errorf("lists during an in-flight refresh fired %d queries; want 2 (warm + the one in flight)", n)
+	}
+
+	close(rec.release)
+	f.bqWG.Wait()
+	if gen := readGen(t, f, "buck"); gen != 2 {
+		t.Errorf("generation after background refresh = %d; want 2", gen)
+	}
+	if got := listNames(t, f, "", false); !reflect.DeepEqual(got, []string{"new.txt"}) {
+		t.Errorf("list after refresh served %v; want [new.txt]", got)
+	}
+}
+
+// 20. concurrent stale lists => one background repopulate total (single-flight),
+// and none of them blocks on it. Run under -race.
+func TestBQCacheBackgroundSingleFlight(t *testing.T) {
+	f, rec := newCountFs(t, countFixture, true)
+	if err := walkDir(f, "", true); err != nil { // warm: gen 1
+		t.Fatal(err)
+	}
+	ageCache(t, f, "buck")
+
+	const M = 8
+	rec.gate = true
+	rec.started = make(chan struct{}, M)
+	rec.release = make(chan struct{})
+
+	var wg sync.WaitGroup
+	var errs [M]error
+	for i := 0; i < M; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			errs[i] = walkDir(f, "d1", false)
+		}(i)
+	}
+	wg.Wait() // all lists answered while the one repopulate is still gated
+	for i, err := range errs {
+		if err != nil {
+			t.Errorf("stale reader %d: %v", i, err)
+		}
+	}
+
+	close(rec.release)
+	f.bqWG.Wait()
+	if n := rec.count(); n != 2 {
+		t.Errorf("%d concurrent stale lists fired %d queries; want 2 (warm + 1 single-flight repopulate)", M, n)
+	}
+}
+
+// 21. Shutdown drains an in-flight background populate before closing the bbolt
+// handle (no write-after-close), and the populate still lands.
+func TestBQCacheShutdownDrainsBackgroundPopulate(t *testing.T) {
+	f, rec := newCountFs(t, countFixture, true)
+	if err := walkDir(f, "", true); err != nil { // warm: gen 1
+		t.Fatal(err)
+	}
+	ageCache(t, f, "buck")
+
+	rec.gate = true
+	rec.started = make(chan struct{}, 1)
+	rec.release = make(chan struct{})
+	if err := walkDir(f, "d1", false); err != nil { // kicks the background populate
+		t.Fatal(err)
+	}
+	<-rec.started // populate is mid-flight
+
+	shutdownDone := make(chan error, 1)
+	go func() { shutdownDone <- f.Shutdown(context.Background()) }()
+	close(rec.release) // let the populate finish; Shutdown must be waiting on it
+	if err := <-shutdownDone; err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+}
+
+// 22. NewObject on a warm cache is a bbolt point lookup: correct metadata, zero
+// BigQuery queries, zero Storage calls (f.svc is nil - a fallback would panic).
+func TestBQCacheCountNewObjectFromCache(t *testing.T) {
+	fixture := []bqRow{
+		// md5 is base64 as the inventory SQL emits it (this is md5("") in base64)
+		{name: "d1/f1.txt", size: "42", md5: "1B2M2Y8AsgTpgAmY7PhCfg==", updated: "2024-03-04T05:06:07Z"},
+	}
+	f, rec := newCountFs(t, fixture, true)
+	if err := walkDir(f, "", true); err != nil { // warm: 1 query
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+	o, err := f.NewObject(ctx, "d1/f1.txt")
+	if err != nil {
+		t.Fatalf("NewObject: %v", err)
+	}
+	if o.Size() != 42 {
+		t.Errorf("Size = %d; want 42", o.Size())
+	}
+	if want := time.Date(2024, 3, 4, 5, 6, 7, 0, time.UTC); !o.ModTime(ctx).Equal(want) {
+		t.Errorf("ModTime = %v; want %v", o.ModTime(ctx), want)
+	}
+	if sum, err := o.Hash(ctx, hash.MD5); err != nil || sum != "d41d8cd98f00b204e9800998ecf8427e" {
+		t.Errorf("Hash = %q, %v; want the hex md5", sum, err)
+	}
+	if n := rec.count(); n != 1 {
+		t.Errorf("NewObject fired %d queries; want 1 (warm only - stats must be free)", n)
+	}
+
+	// misses report ok=false so NewObject can fall back to a real Objects.Get
+	// (an object newer than the inventory); they must not query anything
+	if _, ok := f.bqGetObject("does/not/exist.txt"); ok {
+		t.Error("bqGetObject hit for a missing key")
+	}
+	fCold, recCold := newCountFs(t, fixture, true)
+	if _, ok := fCold.bqGetObject("d1/f1.txt"); ok {
+		t.Error("bqGetObject hit on a cold cache")
+	}
+	if n := rec.count() + recCold.count(); n != 1 {
+		t.Errorf("miss lookups fired %d total queries; want 1 (the warm populate)", n)
 	}
 }

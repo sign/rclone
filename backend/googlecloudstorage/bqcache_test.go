@@ -96,7 +96,7 @@ var fixtureRows = []bqRow{
 
 func TestBQCacheServe(t *testing.T) {
 	f := newTestCacheFs(t)
-	if err := f.bqPopulate(context.Background(), "buck", "", "", false, nil, sliceSource(fixtureRows)); err != nil {
+	if err := f.bqPopulate("buck", sliceSource(fixtureRows)); err != nil {
 		t.Fatalf("populate: %v", err)
 	}
 
@@ -124,7 +124,7 @@ func TestBQCacheServe(t *testing.T) {
 
 func TestBQCacheObjectFields(t *testing.T) {
 	f := newTestCacheFs(t)
-	if err := f.bqPopulate(context.Background(), "buck", "", "", false, nil, sliceSource(fixtureRows)); err != nil {
+	if err := f.bqPopulate("buck", sliceSource(fixtureRows)); err != nil {
 		t.Fatalf("populate: %v", err)
 	}
 	var obj *storage.Object
@@ -145,16 +145,44 @@ func TestBQCacheObjectFields(t *testing.T) {
 	}
 }
 
+// The query's QUALIFY dedup means duplicate names shouldn't reach the cache at
+// all, but if one ever slips through, bbolt's last-Put-wins is the fallback -
+// this pins that a later row for the same name replaces the earlier one.
+func TestBQCachePopulateDuplicateNameKeepsNewest(t *testing.T) {
+	f := newTestCacheFs(t)
+	if err := f.bqPopulate("buck", sliceSource([]bqRow{
+		{name: "a.txt", size: "10", md5: "old", updated: "2024-01-01T00:00:00Z"},
+		{name: "a.txt", size: "20", md5: "new", updated: "2024-06-01T00:00:00Z"},
+	})); err != nil {
+		t.Fatalf("populate: %v", err)
+	}
+	var obj *storage.Object
+	fn := func(remote string, o *storage.Object, _ bool) error {
+		if remote == "a.txt" {
+			obj = o
+		}
+		return nil
+	}
+	if err := f.bqServe(context.Background(), "buck", "", "", false, true, fn); err != nil {
+		t.Fatal(err)
+	}
+	if obj == nil {
+		t.Fatal("a.txt not served")
+	}
+	if obj.Size != 20 || obj.Md5Hash != "new" || obj.Updated != "2024-06-01T00:00:00Z" {
+		t.Errorf("duplicate name kept size %d md5 %q updated %q; want the newest row", obj.Size, obj.Md5Hash, obj.Updated)
+	}
+}
+
 func TestBQCacheGenerationSwap(t *testing.T) {
 	f := newTestCacheFs(t)
-	ctx := context.Background()
-	if err := f.bqPopulate(ctx, "buck", "", "", false, nil, sliceSource([]bqRow{{name: "old.txt", size: "1"}})); err != nil {
+	if err := f.bqPopulate("buck", sliceSource([]bqRow{{name: "old.txt", size: "1"}})); err != nil {
 		t.Fatal(err)
 	}
 	if gen := readGen(t, f, "buck"); gen != 1 {
 		t.Fatalf("first populate generation = %d, want 1", gen)
 	}
-	if err := f.bqPopulate(ctx, "buck", "", "", false, nil, sliceSource([]bqRow{{name: "new.txt", size: "2"}})); err != nil {
+	if err := f.bqPopulate("buck", sliceSource([]bqRow{{name: "new.txt", size: "2"}})); err != nil {
 		t.Fatal(err)
 	}
 	if gen := readGen(t, f, "buck"); gen != 2 {
@@ -180,11 +208,10 @@ func TestBQCacheGenerationSwap(t *testing.T) {
 // an empty source (broken/empty inventory) must not flip and wipe a good cache.
 func TestBQCacheEmptySourceKeepsCache(t *testing.T) {
 	f := newTestCacheFs(t)
-	ctx := context.Background()
-	if err := f.bqPopulate(ctx, "buck", "", "", false, nil, sliceSource([]bqRow{{name: "keep.txt", size: "1"}})); err != nil {
+	if err := f.bqPopulate("buck", sliceSource([]bqRow{{name: "keep.txt", size: "1"}})); err != nil {
 		t.Fatal(err)
 	}
-	if err := f.bqPopulate(ctx, "buck", "", "", false, nil, sliceSource(nil)); err != nil {
+	if err := f.bqPopulate("buck", sliceSource(nil)); err != nil {
 		t.Fatal(err)
 	}
 	if gen := readGen(t, f, "buck"); gen != 1 {
@@ -197,14 +224,13 @@ func TestBQCacheEmptySourceKeepsCache(t *testing.T) {
 
 func TestBQCacheStale(t *testing.T) {
 	f := newTestCacheFs(t)
-	ctx := context.Background()
 
 	// cold: no generation yet
 	if stale, err := f.bqCacheStale("buck"); err != nil || !stale {
 		t.Fatalf("cold: stale=%v err=%v, want stale", stale, err)
 	}
 
-	if err := f.bqPopulate(ctx, "buck", "", "", false, nil, sliceSource([]bqRow{{name: "a.txt", size: "1"}})); err != nil {
+	if err := f.bqPopulate("buck", sliceSource([]bqRow{{name: "a.txt", size: "1"}})); err != nil {
 		t.Fatal(err)
 	}
 	if stale, err := f.bqCacheStale("buck"); err != nil || stale {
