@@ -36,18 +36,32 @@ func TestBQListQuery(t *testing.T) {
 	f.opt.BigQueryTable = "proj.ds.tbl"
 
 	rec, params := f.bqListQuery("buck", "photos/", true)
-	for _, want := range []string{"FROM `proj.ds.tbl`", "STARTS_WITH(name, IFNULL(@dir, ''))", "TO_BASE64(FROM_HEX(md5Hash))", "QUALIFY ROW_NUMBER() OVER (PARTITION BY name ORDER BY snapshotTime DESC) = 1"} {
+	for _, want := range []string{"FROM `proj.ds.tbl`", "TO_BASE64(FROM_HEX(md5Hash))"} {
 		if !strings.Contains(rec, want) {
 			t.Errorf("recursive query missing %q:\n%s", want, rec)
 		}
 	}
-	// a global sort runs on a single BigQuery worker and multiplied the job
-	// time ~8x in production - the newest-per-name dedup must stay a QUALIFY
-	if strings.Contains(rec, "ORDER BY name,") {
-		t.Errorf("recursive query reintroduced a global ORDER BY:\n%s", rec)
+	// the populate is a bare full-table read: bigquery_table requires a
+	// single-bucket, one-row-per-object table, so there is nothing to filter or
+	// dedupe. Anything reintroduced here is scanned over the whole corpus.
+	for _, unwanted := range []string{"WHERE", "QUALIFY", "@bucket", "@dir"} {
+		if strings.Contains(rec, unwanted) {
+			t.Errorf("recursive query should not contain %q:\n%s", unwanted, rec)
+		}
 	}
-	if len(params) != 2 || params[0].Value != "buck" || params[1].Value != "photos/" {
-		t.Errorf("unexpected params: %+v", params)
+	// no parameters may be sent for a query that references none of them
+	if params != nil {
+		t.Errorf("recursive query should send no parameters, got %+v", params)
+	}
+	// The populate writes rows straight into bbolt, whose insert cost collapses if
+	// keys arrive out of order (copy-on-write B+tree: random keys rewrite a leaf
+	// page per row). Sorted rows are what keep it fast, so the trailing ORDER BY
+	// is load-bearing and must stay last - the client library only drops the read
+	// session to the single ordered stream that preserves this order when it sees
+	// a top-level ORDER BY, and bqPopulate's FillPercent=1.0 assumes in-order
+	// appends.
+	if !strings.HasSuffix(rec, " ORDER BY name") {
+		t.Errorf("recursive query must end with a top-level ORDER BY name:\n%s", rec)
 	}
 
 	single, _ := f.bqListQuery("buck", "", false)

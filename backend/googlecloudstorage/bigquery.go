@@ -89,19 +89,32 @@ func (f *Fs) bqListQuery(bucketName, directory string, recurse bool) (string, []
 	const dir = "IFNULL(@dir, '')"
 
 	if recurse {
-		// QUALIFY keeps exactly one row per name - the newest capture - so a
-		// changed object can't cache stale metadata and older duplicates are
-		// never transferred. Deliberately a partitioned window and not a global
-		// ORDER BY: ORDER BY without LIMIT runs on a single BigQuery worker and
-		// multiplied the job time ~8x in production. And not a MAX(snapshotTime)
-		// pin: snapshotTime is per-object (an unchanged file keeps its old one),
-		// so pinning would drop every file unchanged since the last report.
+		// The populate is a bare full-table read, which leans on two documented
+		// requirements of bigquery_table (see its option help): the table holds
+		// exactly one bucket, and exactly one row per object. That is why there is
+		// no "bucket = @bucket" filter - cache keys are the object name with no
+		// bucket component, so a multi-bucket table would list one bucket's
+		// objects under another - and no newest-per-name QUALIFY window.
+		//
+		// There is also no STARTS_WITH(name, @dir) filter: a prefixed remote root
+		// therefore caches the whole bucket. That stays correct (bqServe seeks to
+		// the directory and walks only that prefix) and just wastes cache space.
+		//
+		// ORDER BY name is load-bearing and paid for on purpose. It costs job time
+		// (a global sort without LIMIT funnels through a single BigQuery worker)
+		// and read parallelism (the client sniffs a top-level ORDER BY and drops
+		// the read session to one stream). Both are worth it because neither was
+		// ever the bottleneck: the populate is bound by bbolt insertion, and bbolt
+		// is a copy-on-write B+tree, so random-order keys rewrite ~one leaf page
+		// per row and get slower as the tree grows - measured decaying from 74k
+		// rows/s to 13k rows/s across a 9.26M-row load, and 43x slower than sorted
+		// input at 1M rows in BenchmarkBQPopulateKeyOrder. Sorted keys land
+		// consecutive rows in the same leaf.
 		sql := fmt.Sprintf(
-			"SELECT name, size, %s AS md5Hash, %s AS updated "+
-				"FROM `%s` WHERE bucket = @bucket AND STARTS_WITH(name, %s) "+
-				"QUALIFY ROW_NUMBER() OVER (PARTITION BY name ORDER BY snapshotTime DESC) = 1",
-			md5, ts, tbl, dir)
-		return sql, params
+			"SELECT name, size, %s AS md5Hash, %s AS updated FROM `%s` ORDER BY name",
+			md5, ts, tbl)
+		// no parameters: the query references neither @bucket nor @dir
+		return sql, nil
 	}
 
 	sql := fmt.Sprintf(

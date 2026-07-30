@@ -16,7 +16,7 @@ import (
 
 // newTestCacheFs returns an Fs backed by a fresh bbolt cache in a temp dir
 // (identity path encoding, empty root => remote root is "").
-func newTestCacheFs(t *testing.T) *Fs {
+func newTestCacheFs(t testing.TB) *Fs {
 	t.Helper()
 	f := &Fs{}
 	f.opt.BigQueryCacheMaxAge = fs.Duration(48 * time.Hour)

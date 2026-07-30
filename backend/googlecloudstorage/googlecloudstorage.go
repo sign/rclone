@@ -397,8 +397,15 @@ If set, object listings are served from a local bbolt cache populated from this
 table instead of the Cloud Storage list API - useful for very large buckets. This
 requires bigquery_cache_db to be set. Give a fully-qualified ` + "`project.dataset.table`" + `
 (or ` + "`dataset.table`" + ` with bigquery_billing_project set). The table must have
-columns: bucket, name, size, md5Hash, updated. Object downloads still go through
+columns: name, size, md5Hash, updated. Object downloads still go through
 Cloud Storage.
+
+The populate reads the whole table, so the table must hold exactly one bucket
+and exactly one row per object (i.e. each inventory report replaces the last,
+rather than appending to it). A table covering several buckets would list one
+bucket's objects under another, because cache keys are object names with no
+bucket component. A table keeping several captures per object would cache
+whichever capture happens to sort last.
 
 This needs a BigQuery read scope in addition to the storage scope; with oauth
 (not service account/env auth) you must reconnect to re-consent.
