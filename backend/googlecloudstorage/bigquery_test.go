@@ -35,7 +35,7 @@ func TestBQListQuery(t *testing.T) {
 	f := &Fs{}
 	f.opt.BigQueryTable = "proj.ds.tbl"
 
-	rec, params := f.bqListQuery("buck", "photos/", true)
+	rec := f.bqListQuery()
 	for _, want := range []string{"FROM `proj.ds.tbl`", "TO_BASE64(FROM_HEX(md5Hash))"} {
 		if !strings.Contains(rec, want) {
 			t.Errorf("recursive query missing %q:\n%s", want, rec)
@@ -49,10 +49,6 @@ func TestBQListQuery(t *testing.T) {
 			t.Errorf("recursive query should not contain %q:\n%s", unwanted, rec)
 		}
 	}
-	// no parameters may be sent for a query that references none of them
-	if params != nil {
-		t.Errorf("recursive query should send no parameters, got %+v", params)
-	}
 	// The populate writes rows straight into bbolt, whose insert cost collapses if
 	// keys arrive out of order (copy-on-write B+tree: random keys rewrite a leaf
 	// page per row). Sorted rows are what keep it fast, so the trailing ORDER BY
@@ -62,13 +58,6 @@ func TestBQListQuery(t *testing.T) {
 	// appends.
 	if !strings.HasSuffix(rec, " ORDER BY name") {
 		t.Errorf("recursive query must end with a top-level ORDER BY name:\n%s", rec)
-	}
-
-	single, _ := f.bqListQuery("buck", "", false)
-	for _, want := range []string{"UNION DISTINCT", "REGEXP_EXTRACT(rel, r'^[^/]+/')", "STRPOS(rel, '/') = 0"} {
-		if !strings.Contains(single, want) {
-			t.Errorf("single-level query missing %q:\n%s", want, single)
-		}
 	}
 }
 
