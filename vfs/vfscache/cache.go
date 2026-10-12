@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path"
 	"path/filepath"
@@ -27,7 +28,6 @@ import (
 	"github.com/rclone/rclone/lib/systemd"
 	"github.com/rclone/rclone/vfs/vfscache/writeback"
 	"github.com/rclone/rclone/vfs/vfscommon"
-	"golang.org/x/sync/errgroup"
 )
 
 // NB as Cache and Item are tightly linked it is necessary to have a
@@ -515,25 +515,109 @@ func (c *Cache) CleanUp() error {
 	return err2
 }
 
-// walk walks the cache calling the function
-func (c *Cache) walk(dir string, fn func(osPath string, fi os.FileInfo, name string) error) error {
-	return filepath.Walk(dir, func(osPath string, fi os.FileInfo, err error) error {
+// walk walks the cache calling fn for each entry found, with up to
+// concurrency entries being processed at once.
+//
+// It reads each directory with Readdirnames, which returns names only, so the
+// listing never blocks on inode attributes. The Lstat of each entry - which on
+// a high latency cache directory is by far the most expensive part, and is
+// what filepath.Walk does serially on the calling goroutine - is then done by
+// the workers. fn may be called concurrently from several goroutines.
+func (c *Cache) walk(dir string, concurrency int, fn func(osPath string, fi os.FileInfo, name string) error) error {
+	if concurrency < 1 {
+		concurrency = 1
+	}
+	var (
+		wg       sync.WaitGroup
+		sem      = make(chan struct{}, concurrency)
+		errOnce  sync.Once
+		firstErr error
+	)
+	setErr := func(err error) {
 		if err != nil {
-			return err
+			errOnce.Do(func() { firstErr = err })
 		}
-		// Find path relative to the cache root
-		name, err := filepath.Rel(dir, osPath)
-		if err != nil {
-			return fmt.Errorf("filepath.Rel failed in walk: %w", err)
-		}
-		if name == "." {
-			name = ""
-		}
-		// And convert into slashes
-		name = filepath.ToSlash(name)
+	}
 
-		return fn(osPath, fi, name)
-	})
+	// visit processes one entry, recursing into it if it is a directory.
+	var visit func(osPath, name string)
+	// walkDir lists one directory and dispatches its entries.
+	var walkDir func(osPath, name string)
+
+	visit = func(osPath, name string) {
+		fi, err := os.Lstat(osPath)
+		if err != nil {
+			setErr(err)
+			return
+		}
+		if err := fn(osPath, fi, name); err != nil {
+			setErr(err)
+			return
+		}
+		if fi.IsDir() {
+			walkDir(osPath, name)
+		}
+	}
+
+	walkDir = func(osPath, name string) {
+		f, err := os.Open(osPath)
+		if err != nil {
+			setErr(err)
+			return
+		}
+		defer func() {
+			setErr(f.Close())
+		}()
+		for {
+			// names only - no Lstat, so a directory with a million
+			// entries lists in milliseconds
+			names, err := f.Readdirnames(1024)
+			for _, n := range names {
+				childOSPath := filepath.Join(osPath, n)
+				childName := n
+				if name != "" {
+					childName = name + "/" + n
+				}
+				wg.Add(1)
+				run := func() {
+					defer wg.Done()
+					visit(childOSPath, childName)
+				}
+				// Take a worker slot if one is free, otherwise do the
+				// work inline. Blocking here instead would deadlock
+				// once every worker is itself waiting for a slot.
+				select {
+				case sem <- struct{}{}:
+					go func() {
+						defer func() { <-sem }()
+						run()
+					}()
+				default:
+					run()
+				}
+			}
+			if err != nil {
+				if err != io.EOF {
+					setErr(err)
+				}
+				return
+			}
+		}
+	}
+
+	// the root itself, matching filepath.Walk which visits it first
+	rootFi, err := os.Lstat(dir)
+	if err != nil {
+		return err
+	}
+	if err := fn(dir, rootFi, ""); err != nil {
+		return err
+	}
+	if rootFi.IsDir() {
+		walkDir(dir, "")
+	}
+	wg.Wait()
+	return firstErr
 }
 
 // reload walks the cache loading metadata files
@@ -542,72 +626,51 @@ func (c *Cache) walk(dir string, fn func(osPath string, fi os.FileInfo, name str
 // to find any new items iterating the metadata but it will clear up
 // orphan files.
 //
-// Creating an item stats its backing file and reads and decodes its
-// metadata file. On a cache directory with any appreciable latency -
-// an NFS mount, say - that is milliseconds per item, and it used to be
-// done one item at a time under c.mu, so a large cache took many
-// minutes to load before the mount came up. The items are created
-// concurrently here instead, and outside c.mu.
+// The walk is concurrent (see Cache.walk) and newItem - which stats the
+// backing file and reads and decodes the metadata file - runs on the walk's
+// workers, so it must not be called under c.mu as _get used to do.
 //
-// They are then added to the cache and reloaded serially in walk
-// order, so the ordering of any writeback triggered by a dirty item is
-// the same as it ever was.
+// The items are then passed to item.reload serially, in sorted order, so that
+// writing back any dirty ones is sequenced deterministically.
 func (c *Cache) reload(ctx context.Context) error {
-	concurrency := c.opt.CacheReloadConcurrency
-	if concurrency < 1 {
-		concurrency = 1
-	}
 	for _, dir := range []string{c.root, c.metaRoot} {
 		var (
-			mu    sync.Mutex // protects names and items below
-			names []string
-			items []*Item
+			mu    sync.Mutex
+			found []*Item
 		)
-		g, gCtx := errgroup.WithContext(ctx)
-		g.SetLimit(concurrency)
-		// g.Go blocks once concurrency items are in flight, which
-		// keeps the walk from running arbitrarily far ahead.
-		walkErr := c.walk(dir, func(osPath string, fi os.FileInfo, name string) error {
+		err := c.walk(dir, c.opt.CacheReloadConcurrency, func(osPath string, fi os.FileInfo, name string) error {
 			if fi.IsDir() {
 				return nil
 			}
 			name = clean(name)
-			// The metaRoot walk revisits everything the root walk
-			// loaded, so most of the second pass drops out here
-			// without queueing any work.
 			c.mu.Lock()
-			_, found := c.item[name]
+			_, exists := c.item[name]
 			c.mu.Unlock()
-			if found {
+			if exists {
+				// the metaRoot walk revisits what the root walk loaded
 				return nil
 			}
+			// newItem does the IO - deliberately not under c.mu
+			item := newItem(c, name)
+			c.mu.Lock()
+			if _, dup := c.item[name]; dup {
+				c.mu.Unlock()
+				return nil
+			}
+			c.item[name] = item
+			c.mu.Unlock()
 			mu.Lock()
-			i := len(names)
-			names = append(names, name)
-			items = append(items, nil)
+			found = append(found, item)
 			mu.Unlock()
-			g.Go(func() error {
-				// newItem does the IO - it must not be called under c.mu
-				item := newItem(c, name)
-				mu.Lock()
-				items[i] = item
-				mu.Unlock()
-				return gCtx.Err()
-			})
 			return nil
 		})
-		if err := g.Wait(); err != nil && walkErr == nil {
-			walkErr = err
+		if err != nil {
+			return fmt.Errorf("failed to walk cache %q: %w", dir, err)
 		}
-		if walkErr != nil {
-			return fmt.Errorf("failed to walk cache %q: %w", dir, walkErr)
-		}
-		for i, name := range names {
-			c.mu.Lock()
-			c.item[name] = items[i]
-			c.mu.Unlock()
-			if err := items[i].reload(ctx); err != nil {
-				fs.Errorf(name, "vfs cache: failed to reload item: %v", err)
+		sort.Slice(found, func(i, j int) bool { return found[i].name < found[j].name })
+		for _, item := range found {
+			if err := item.reload(ctx); err != nil {
+				fs.Errorf(item.name, "vfs cache: failed to reload item: %v", err)
 			}
 		}
 	}

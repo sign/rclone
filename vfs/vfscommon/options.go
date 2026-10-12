@@ -77,7 +77,7 @@ var OptionsInfo = fs.Options{{
 	Groups:  "VFS",
 }, {
 	Name:    "vfs_cache_reload_concurrency",
-	Default: 32,
+	Default: 16,
 	Help:    "Number of checkers to use when loading the cache at startup",
 	Groups:  "VFS",
 }, {
