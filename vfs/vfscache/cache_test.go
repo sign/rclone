@@ -857,3 +857,39 @@ func TestCacheReloadDirtyOrder(t *testing.T) {
 	}
 	assert.Equal(t, dirty, got)
 }
+
+// With --vfs-cache-reload-async the cache scan runs in the background, so New
+// returns before it has finished. Items it has not reached yet must still be
+// picked up off disk when they are opened, otherwise the cache would look
+// empty until the scan completed.
+func TestCacheReloadAsync(t *testing.T) {
+	opt := vfscommon.Opt
+	opt.CachePollInterval = 0
+	opt.WriteBack = 0
+	opt.HandleCaching = 0
+
+	r, c := newTestCacheOpt(t, opt)
+
+	const items = 50
+	fillCache(t, c, items)
+	want := itemAsString(c)
+	require.Len(t, want, items)
+
+	opt.CacheReloadAsync = true
+	async := reloadCache(t, r, opt)
+
+	// The scan races with us by design, so wait for it to converge.
+	for range 100 {
+		if len(itemAsString(async)) == items {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	assert.Equal(t, want, itemAsString(async))
+
+	// An item is usable regardless of whether the scan reached it, because
+	// Item() builds it from what is on disk.
+	item := async.Item("dir00/file000")
+	require.NotNil(t, item)
+	assert.True(t, async.Exists("dir00/file000"))
+}

@@ -133,18 +133,34 @@ func New(ctx context.Context, fremote fs.Fs, opt *vfscommon.Options, avFn AddVir
 		avFn:       avFn,
 	}
 
-	// load in the cache and metadata off disk
-	err = c.reload(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("failed to load cache: %w", err)
-	}
-
-	// Remove any empty directories
-	c.purgeEmptyDirs("", true)
-
 	// Create a channel for cleaner to be kicked upon out of space con
 	c.kick = make(chan struct{}, 1)
 	c.cond = sync.Cond{L: &c.mu}
+
+	// load in the cache and metadata off disk
+	//
+	// This scans every item in the cache, so on a large cache on high latency
+	// storage it can take a long time, and nothing is mounted until it
+	// finishes. With --vfs-cache-reload-async it runs in the background
+	// instead: items not scanned yet are picked up off disk when they are
+	// first opened, so the cache is still used, but the size the cleaner
+	// enforces quotas against only becomes accurate once the scan completes.
+	if opt.CacheReloadAsync {
+		go func() {
+			if err := c.reload(ctx); err != nil {
+				fs.Errorf(fremote, "vfs cache: failed to load cache: %v", err)
+				return
+			}
+			c.purgeEmptyDirs("", true)
+			fs.Infof(fremote, "vfs cache: loaded %d items", c.TotalItems())
+		}()
+	} else {
+		if err = c.reload(ctx); err != nil {
+			return nil, fmt.Errorf("failed to load cache: %w", err)
+		}
+		// Remove any empty directories
+		c.purgeEmptyDirs("", true)
+	}
 
 	go c.cleaner(ctx)
 
@@ -979,6 +995,13 @@ func (c *Cache) cleaner(ctx context.Context) {
 			return
 		}
 	}
+}
+
+// TotalItems returns the number of items in the cache
+func (c *Cache) TotalItems() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.item)
 }
 
 // TotalInUse returns the number of items in the cache which are InUse

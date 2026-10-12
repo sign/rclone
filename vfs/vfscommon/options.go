@@ -81,6 +81,11 @@ var OptionsInfo = fs.Options{{
 	Help:    "Number of checkers to use when loading the cache at startup",
 	Groups:  "VFS",
 }, {
+	Name:    "vfs_cache_reload_async",
+	Default: false,
+	Help:    "Load the cache in the background, so the mount is usable immediately",
+	Groups:  "VFS",
+}, {
 	Name:    "vfs_read_chunk_size",
 	Default: 128 * fs.Mebi,
 	Help:    "Read the source objects in chunks",
@@ -209,6 +214,7 @@ type Options struct {
 	CacheMaxAge            fs.Duration   `config:"vfs_cache_max_age"`
 	CacheMaxSize           fs.SizeSuffix `config:"vfs_cache_max_size"`
 	CacheMinFreeSpace      fs.SizeSuffix `config:"vfs_cache_min_free_space"`
+	CacheReloadAsync       bool          `config:"vfs_cache_reload_async"`
 	CacheReloadConcurrency int           `config:"vfs_cache_reload_concurrency"` // number of parallel workers used to load the cache at startup
 	CachePollInterval      fs.Duration   `config:"vfs_cache_poll_interval"`
 	CaseInsensitive        bool          `config:"vfs_case_insensitive"`
