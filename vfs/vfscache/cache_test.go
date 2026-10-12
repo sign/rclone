@@ -3,6 +3,7 @@ package vfscache
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -1127,6 +1128,93 @@ func TestCacheReloadWalkErrorStillReloads(t *testing.T) {
 	got := getAvInfos()
 	sort.Strings(got)
 	assert.Equal(t, dirty, got)
+}
+
+// setReadDirNames swaps the directory lister out for the duration of a test.
+func setReadDirNames(t *testing.T, fn func(osPath string) ([]string, error)) {
+	old := readDirNames
+	readDirNames = fn
+	t.Cleanup(func() { readDirNames = old })
+}
+
+// Readdirnames hands back the names it read before a failure along with the
+// error, so a listing that fails part way through still has names worth
+// walking. walk used to discard them, which matters because the cache mirrors
+// the remote: one directory can hold most of the entries - the tree this was
+// written for has over a million in one of them - so a single transient
+// listing error lost the writeback of nearly everything dirty in the cache.
+//
+// The filesystem cannot be asked to fail half way through a listing, so the
+// failure is injected.
+func TestCacheReloadWalkUsesPartialListing(t *testing.T) {
+	opt := vfscommon.Opt
+	opt.CachePollInterval = 0
+	opt.WriteBack = 0
+	opt.HandleCaching = 0
+	opt.CacheReloadConcurrency = 8
+
+	r, c := newTestCacheOpt(t, opt)
+
+	// 4 items in each of the 7 directories fillCache makes, all dirty, so
+	// every one the walk reaches is written back and shows up in avInfos.
+	const items = 28
+	fillCache(t, c, items)
+	for i := 0; i < items; i++ {
+		markDirty(t, c, fmt.Sprintf("dir%02d/file%03d", i%7, i))
+	}
+
+	// Listing the cache root returns half of its names and then fails.
+	// Remember which, so the test does not have to assume how fillCache
+	// spreads the items about.
+	errListing := errors.New("listing failed part way through")
+	dataRoot := c.root
+	realReadDirNames := readDirNames
+	var (
+		keptMu sync.Mutex
+		kept   = map[string]bool{}
+	)
+	setReadDirNames(t, func(osPath string) ([]string, error) {
+		names, err := realReadDirNames(osPath)
+		if osPath != dataRoot || err != nil {
+			return names, err
+		}
+		sort.Strings(names)
+		names = names[:len(names)/2]
+		keptMu.Lock()
+		for _, name := range names {
+			kept[name] = true
+		}
+		keptMu.Unlock()
+		return names, errListing
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	resetAvInfos()
+	failed, err := New(ctx, r.Fremote, &opt, addVirtual)
+
+	// The failure is still reported - the walk is incomplete, so the cache
+	// cannot be trusted to be fully loaded...
+	require.Error(t, err)
+	assert.Nil(t, failed)
+	assert.ErrorIs(t, err, errListing)
+
+	// ...but giving up on the names the failed listing did return would
+	// leave those items unflushed.
+	var want []string
+	keptMu.Lock()
+	for i := 0; i < items; i++ {
+		dir := fmt.Sprintf("dir%02d", i%7)
+		if kept[dir] {
+			want = append(want, fmt.Sprintf("%s/file%03d", dir, i))
+		}
+	}
+	keptMu.Unlock()
+	require.NotEmpty(t, want, "the listing stub kept nothing - the test proves nothing")
+	got := getAvInfos()
+	sort.Strings(got)
+	sort.Strings(want)
+	assert.Equal(t, want, got)
 }
 
 // walk returns immediately when handed a context that is already cancelled.

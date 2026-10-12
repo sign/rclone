@@ -566,7 +566,14 @@ func (c *Cache) CleanUp() error {
 // nests, and a deep tree at high concurrency then runs out of file
 // descriptors. On EMFILE a synchronous load fails New entirely, and
 // SetCacheMode turns that into a mount with no cache at all.
-func readDirNames(osPath string) (names []string, err error) {
+//
+// A failed listing is not always an empty one: Readdirnames returns the names
+// it read before the failure along with the error, and both are passed on so
+// that the caller can use the one and report the other.
+//
+// It is a variable so that the tests can inject a listing that fails part way
+// through - something the filesystem cannot be asked to do on demand.
+var readDirNames = func(osPath string) (names []string, err error) {
 	f, err := os.Open(osPath)
 	if err != nil {
 		return nil, err
@@ -645,12 +652,15 @@ func (c *Cache) walk(ctx context.Context, dir string, concurrency int, fn func(o
 			setErr(err)
 			return
 		}
+		// A listing that fails part way through still returns the names it
+		// read, and the walk carries on past errors, so dispatch those before
+		// reporting the failure rather than discarding them. A single
+		// directory can hold a large fraction of the cache - the tree this was
+		// written for has over a million entries in one of them - so dropping
+		// its listing drops the writeback of everything dirty in it too.
 		names, err := readDirNames(osPath)
-		if err != nil {
-			if !os.IsNotExist(err) { // removed under us - see visit
-				setErr(err)
-			}
-			return
+		if err != nil && !os.IsNotExist(err) { // removed under us - see visit
+			setErr(err)
 		}
 		for _, n := range names {
 			if cerr := ctx.Err(); cerr != nil {
