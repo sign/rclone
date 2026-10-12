@@ -62,71 +62,41 @@ func resolveBQProject(opt *Options) (string, error) {
 	return "", errors.New("can't determine BigQuery billing project: set bigquery_billing_project or use a fully-qualified project.dataset.table")
 }
 
-// bqListQuery builds the GoogleSQL listing query and its named parameters.
+// bqListQuery builds the GoogleSQL populate query: one full-table read of the
+// inventory, the only query bigquery_table ever runs (see bqQueryRows).
 //
 // updated is formatted to RFC3339Nano so it drops straight into
 // storage.Object.Updated; md5Hash is converted from the inventory's hex to base64
 // so both are parsed by setMetaData unchanged (it base64-decodes the hash and
 // RFC3339-parses the time).
 //
-// @dir is always read through IFNULL(@dir, ”): an empty named STRING parameter
-// has historically been easy to bind as NULL (REST omitempty dropped the value),
-// and NULL would make STARTS_WITH match nothing at the root - IFNULL makes the
-// query immune to how the client library serializes "".
+// The populate is a bare full-table read, which leans on two documented
+// requirements of bigquery_table (see its option help): the table holds
+// exactly one bucket, and exactly one row per object. That is why there is
+// no bucket filter - cache keys are the object name with no bucket
+// component, so a multi-bucket table would list one bucket's objects under
+// another - and no newest-per-name QUALIFY window.
 //
-// Recursive lists every object under @dir. Single-level returns objects directly in
-// @dir plus a synthesized row per immediate sub-directory (name ending in "/", which
-// objectRemote then recognises as a directory) - the SQL equivalent of the list
-// API's "/" delimiter common-prefixes.
-func (f *Fs) bqListQuery(bucketName, directory string, recurse bool) (string, []bq.QueryParameter) {
-	tbl := f.opt.BigQueryTable
-	params := []bq.QueryParameter{
-		{Name: "bucket", Value: bucketName},
-		{Name: "dir", Value: directory},
-	}
+// There is also no STARTS_WITH(name, dir) filter: a prefixed remote root
+// therefore caches the whole bucket. That stays correct (bqServe seeks to
+// the directory and walks only that prefix) and just wastes cache space.
+//
+// ORDER BY name is load-bearing and paid for on purpose. It costs job time
+// (a global sort without LIMIT funnels through a single BigQuery worker)
+// and read parallelism (the client sniffs a top-level ORDER BY and drops
+// the read session to one stream). Both are worth it because neither was
+// ever the bottleneck: the populate is bound by bbolt insertion, and bbolt
+// is a copy-on-write B+tree, so random-order keys rewrite ~one leaf page
+// per row and get slower as the tree grows - measured decaying from 74k
+// rows/s to 13k rows/s across a 9.26M-row load, and 43x slower than sorted
+// input at 1M rows in BenchmarkBQPopulateKeyOrder. Sorted keys land
+// consecutive rows in the same leaf.
+func (f *Fs) bqListQuery() string {
 	const ts = "FORMAT_TIMESTAMP('%Y-%m-%dT%H:%M:%E*SZ', updated)"
 	const md5 = "TO_BASE64(FROM_HEX(md5Hash))" // Storage Insights stores md5Hash as hex; setMetaData wants base64
-	const dir = "IFNULL(@dir, '')"
-
-	if recurse {
-		// The populate is a bare full-table read, which leans on two documented
-		// requirements of bigquery_table (see its option help): the table holds
-		// exactly one bucket, and exactly one row per object. That is why there is
-		// no "bucket = @bucket" filter - cache keys are the object name with no
-		// bucket component, so a multi-bucket table would list one bucket's
-		// objects under another - and no newest-per-name QUALIFY window.
-		//
-		// There is also no STARTS_WITH(name, @dir) filter: a prefixed remote root
-		// therefore caches the whole bucket. That stays correct (bqServe seeks to
-		// the directory and walks only that prefix) and just wastes cache space.
-		//
-		// ORDER BY name is load-bearing and paid for on purpose. It costs job time
-		// (a global sort without LIMIT funnels through a single BigQuery worker)
-		// and read parallelism (the client sniffs a top-level ORDER BY and drops
-		// the read session to one stream). Both are worth it because neither was
-		// ever the bottleneck: the populate is bound by bbolt insertion, and bbolt
-		// is a copy-on-write B+tree, so random-order keys rewrite ~one leaf page
-		// per row and get slower as the tree grows - measured decaying from 74k
-		// rows/s to 13k rows/s across a 9.26M-row load, and 43x slower than sorted
-		// input at 1M rows in BenchmarkBQPopulateKeyOrder. Sorted keys land
-		// consecutive rows in the same leaf.
-		sql := fmt.Sprintf(
-			"SELECT name, size, %s AS md5Hash, %s AS updated FROM `%s` ORDER BY name",
-			md5, ts, tbl)
-		// no parameters: the query references neither @bucket nor @dir
-		return sql, nil
-	}
-
-	sql := fmt.Sprintf(
-		"WITH objs AS ("+
-			"SELECT name, size, %s AS md5Hash, %s AS updated, SUBSTR(name, LENGTH(%s)+1) AS rel "+
-			"FROM `%s` WHERE bucket = @bucket AND STARTS_WITH(name, %s)) "+
-			"SELECT name, size, md5Hash, updated FROM objs WHERE STRPOS(rel, '/') = 0 "+
-			"UNION DISTINCT "+
-			"SELECT CONCAT(%s, REGEXP_EXTRACT(rel, r'^[^/]+/')), CAST(0 AS INT64), CAST(NULL AS STRING), CAST(NULL AS STRING) "+
-			"FROM objs WHERE STRPOS(rel, '/') > 0",
-		md5, ts, dir, tbl, dir, dir)
-	return sql, params
+	return fmt.Sprintf(
+		"SELECT name, size, %s AS md5Hash, %s AS updated FROM `%s` ORDER BY name",
+		md5, ts, f.opt.BigQueryTable)
 }
 
 // valueString reads a BigQuery result value as a string (size arrives as int64;
@@ -176,9 +146,7 @@ func (f *Fs) bqQueryRows(ctx context.Context, bucketName, directory string, recu
 		defer cancel()
 	}
 	fs.Infof(f, "BigQuery listing cache: running BigQuery query to populate %q (dir=%q, recurse=%v)", bucketName, directory, recurse)
-	sql, params := f.bqListQuery(bucketName, directory, recurse)
-	q := f.bqClient.Query(sql)
-	q.Parameters = params
+	q := f.bqClient.Query(f.bqListQuery())
 
 	start := time.Now()
 	job, err := q.Run(ctx)
