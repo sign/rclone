@@ -76,6 +76,16 @@ var OptionsInfo = fs.Options{{
 	Help:    "Target minimum free space on the disk containing the cache",
 	Groups:  "VFS",
 }, {
+	Name:    "vfs_cache_reload_concurrency",
+	Default: 16,
+	Help:    "Number of workers to use when loading the cache at startup",
+	Groups:  "VFS",
+}, {
+	Name:    "vfs_cache_reload_async",
+	Default: false,
+	Help:    "Load the cache in the background so the mount is usable immediately (requires --read-only; no writeback, orphan cleanup or accurate quota until it finishes)",
+	Groups:  "VFS",
+}, {
 	Name:    "vfs_read_chunk_size",
 	Default: 128 * fs.Mebi,
 	Help:    "Read the source objects in chunks",
@@ -183,39 +193,41 @@ func init() {
 
 // Options is options for creating the vfs
 type Options struct {
-	NoSeek             bool          `config:"no_seek"`        // don't allow seeking if set
-	NoChecksum         bool          `config:"no_checksum"`    // don't check checksums if set
-	ReadOnly           bool          `config:"read_only"`      // if set VFS is read only
-	Links              bool          `config:"vfs_links"`      // if set interpret link files
-	NoModTime          bool          `config:"no_modtime"`     // don't read mod times for files
-	DirCacheTime       fs.Duration   `config:"dir_cache_time"` // how long to consider directory listing cache valid
-	Refresh            bool          `config:"vfs_refresh"`    // refreshes the directory listing recursively on start
-	PollInterval       fs.Duration   `config:"poll_interval"`
-	Umask              FileMode      `config:"umask"`
-	UID                uint32        `config:"uid"`
-	GID                uint32        `config:"gid"`
-	DirPerms           FileMode      `config:"dir_perms"`
-	FilePerms          FileMode      `config:"file_perms"`
-	LinkPerms          FileMode      `config:"link_perms"`
-	ChunkSize          fs.SizeSuffix `config:"vfs_read_chunk_size"`       // if > 0 read files in chunks
-	ChunkSizeLimit     fs.SizeSuffix `config:"vfs_read_chunk_size_limit"` // if > ChunkSize double the chunk size after each chunk until reached
-	ChunkStreams       int           `config:"vfs_read_chunk_streams"`    // Number of download streams to use
-	CacheMode          CacheMode     `config:"vfs_cache_mode"`
-	CacheMaxAge        fs.Duration   `config:"vfs_cache_max_age"`
-	CacheMaxSize       fs.SizeSuffix `config:"vfs_cache_max_size"`
-	CacheMinFreeSpace  fs.SizeSuffix `config:"vfs_cache_min_free_space"`
-	CachePollInterval  fs.Duration   `config:"vfs_cache_poll_interval"`
-	CaseInsensitive    bool          `config:"vfs_case_insensitive"`
-	BlockNormDupes     bool          `config:"vfs_block_norm_dupes"`
-	WriteWait          fs.Duration   `config:"vfs_write_wait"`       // time to wait for in-sequence write
-	ReadWait           fs.Duration   `config:"vfs_read_wait"`        // time to wait for in-sequence read
-	WriteBack          fs.Duration   `config:"vfs_write_back"`       // time to wait before writing back dirty files
-	ReadAhead          fs.SizeSuffix `config:"vfs_read_ahead"`       // bytes to read ahead in cache mode "full"
-	UsedIsSize         bool          `config:"vfs_used_is_size"`     // if true, use the `rclone size` algorithm for Used size
-	FastFingerprint    bool          `config:"vfs_fast_fingerprint"` // if set use fast fingerprints
-	DiskSpaceTotalSize fs.SizeSuffix `config:"vfs_disk_space_total_size"`
-	HandleCaching      fs.Duration   `config:"vfs_handle_caching"`     // time to keep handle alive after last close
-	MetadataExtension  string        `config:"vfs_metadata_extension"` // if set respond to files with this extension with metadata
+	NoSeek                 bool          `config:"no_seek"`        // don't allow seeking if set
+	NoChecksum             bool          `config:"no_checksum"`    // don't check checksums if set
+	ReadOnly               bool          `config:"read_only"`      // if set VFS is read only
+	Links                  bool          `config:"vfs_links"`      // if set interpret link files
+	NoModTime              bool          `config:"no_modtime"`     // don't read mod times for files
+	DirCacheTime           fs.Duration   `config:"dir_cache_time"` // how long to consider directory listing cache valid
+	Refresh                bool          `config:"vfs_refresh"`    // refreshes the directory listing recursively on start
+	PollInterval           fs.Duration   `config:"poll_interval"`
+	Umask                  FileMode      `config:"umask"`
+	UID                    uint32        `config:"uid"`
+	GID                    uint32        `config:"gid"`
+	DirPerms               FileMode      `config:"dir_perms"`
+	FilePerms              FileMode      `config:"file_perms"`
+	LinkPerms              FileMode      `config:"link_perms"`
+	ChunkSize              fs.SizeSuffix `config:"vfs_read_chunk_size"`       // if > 0 read files in chunks
+	ChunkSizeLimit         fs.SizeSuffix `config:"vfs_read_chunk_size_limit"` // if > ChunkSize double the chunk size after each chunk until reached
+	ChunkStreams           int           `config:"vfs_read_chunk_streams"`    // Number of download streams to use
+	CacheMode              CacheMode     `config:"vfs_cache_mode"`
+	CacheMaxAge            fs.Duration   `config:"vfs_cache_max_age"`
+	CacheMaxSize           fs.SizeSuffix `config:"vfs_cache_max_size"`
+	CacheMinFreeSpace      fs.SizeSuffix `config:"vfs_cache_min_free_space"`
+	CacheReloadAsync       bool          `config:"vfs_cache_reload_async"`
+	CacheReloadConcurrency int           `config:"vfs_cache_reload_concurrency"` // number of parallel workers used to load the cache at startup
+	CachePollInterval      fs.Duration   `config:"vfs_cache_poll_interval"`
+	CaseInsensitive        bool          `config:"vfs_case_insensitive"`
+	BlockNormDupes         bool          `config:"vfs_block_norm_dupes"`
+	WriteWait              fs.Duration   `config:"vfs_write_wait"`       // time to wait for in-sequence write
+	ReadWait               fs.Duration   `config:"vfs_read_wait"`        // time to wait for in-sequence read
+	WriteBack              fs.Duration   `config:"vfs_write_back"`       // time to wait before writing back dirty files
+	ReadAhead              fs.SizeSuffix `config:"vfs_read_ahead"`       // bytes to read ahead in cache mode "full"
+	UsedIsSize             bool          `config:"vfs_used_is_size"`     // if true, use the `rclone size` algorithm for Used size
+	FastFingerprint        bool          `config:"vfs_fast_fingerprint"` // if set use fast fingerprints
+	DiskSpaceTotalSize     fs.SizeSuffix `config:"vfs_disk_space_total_size"`
+	HandleCaching          fs.Duration   `config:"vfs_handle_caching"`     // time to keep handle alive after last close
+	MetadataExtension      string        `config:"vfs_metadata_extension"` // if set respond to files with this extension with metadata
 }
 
 // Opt is the default options modified by the environment variables and command line flags
@@ -240,4 +252,28 @@ func (opt *Options) Init(ctx context.Context) {
 
 	// Make sure links are returned as links
 	opt.LinkPerms |= FileMode(os.ModeSymlink)
+
+	// Loading the cache in the background is only safe on a read-only mount -
+	// see the comment on reload. Refuse it rather than load asynchronously
+	// and quietly skip the writeback of items that were already dirty on
+	// disk. This can't be reported by failing vfscache.New: SetCacheMode
+	// turns that into "disable the cache and carry on", which would leave a
+	// mount with no cache at all over a flag mistake.
+	if opt.CacheReloadAsync && !opt.ReadOnly {
+		fs.Errorf(nil, "vfs cache: ignoring --vfs-cache-reload-async: it requires --read-only")
+		opt.CacheReloadAsync = false
+	}
+
+	// An unbounded worker count would be a goroutine and file descriptor per
+	// cache entry; past a point more workers only make the cache directory
+	// slower anyway.
+	if opt.CacheReloadConcurrency < 1 {
+		opt.CacheReloadConcurrency = 1
+	} else if opt.CacheReloadConcurrency > maxCacheReloadConcurrency {
+		fs.Errorf(nil, "vfs cache: limiting --vfs-cache-reload-concurrency to %d", maxCacheReloadConcurrency)
+		opt.CacheReloadConcurrency = maxCacheReloadConcurrency
+	}
 }
+
+// maxCacheReloadConcurrency caps --vfs-cache-reload-concurrency
+const maxCacheReloadConcurrency = 1024
