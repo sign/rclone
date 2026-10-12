@@ -27,6 +27,7 @@ import (
 	"github.com/rclone/rclone/lib/systemd"
 	"github.com/rclone/rclone/vfs/vfscache/writeback"
 	"github.com/rclone/rclone/vfs/vfscommon"
+	"golang.org/x/sync/errgroup"
 )
 
 // NB as Cache and Item are tightly linked it is necessary to have a
@@ -540,23 +541,74 @@ func (c *Cache) walk(dir string, fn func(osPath string, fi os.FileInfo, name str
 // It iterates the files first then metadata trees. It doesn't expect
 // to find any new items iterating the metadata but it will clear up
 // orphan files.
+//
+// Creating an item stats its backing file and reads and decodes its
+// metadata file. On a cache directory with any appreciable latency -
+// an NFS mount, say - that is milliseconds per item, and it used to be
+// done one item at a time under c.mu, so a large cache took many
+// minutes to load before the mount came up. The items are created
+// concurrently here instead, and outside c.mu.
+//
+// They are then added to the cache and reloaded serially in walk
+// order, so the ordering of any writeback triggered by a dirty item is
+// the same as it ever was.
 func (c *Cache) reload(ctx context.Context) error {
+	concurrency := c.opt.CacheReloadConcurrency
+	if concurrency < 1 {
+		concurrency = 1
+	}
 	for _, dir := range []string{c.root, c.metaRoot} {
-		err := c.walk(dir, func(osPath string, fi os.FileInfo, name string) error {
+		var (
+			mu    sync.Mutex // protects names and items below
+			names []string
+			items []*Item
+		)
+		g, gCtx := errgroup.WithContext(ctx)
+		g.SetLimit(concurrency)
+		// g.Go blocks once concurrency items are in flight, which
+		// keeps the walk from running arbitrarily far ahead.
+		walkErr := c.walk(dir, func(osPath string, fi os.FileInfo, name string) error {
 			if fi.IsDir() {
 				return nil
 			}
-			item, found := c.get(name)
-			if !found {
-				err := item.reload(ctx)
-				if err != nil {
-					fs.Errorf(name, "vfs cache: failed to reload item: %v", err)
-				}
+			name = clean(name)
+			// The metaRoot walk revisits everything the root walk
+			// loaded, so most of the second pass drops out here
+			// without queueing any work.
+			c.mu.Lock()
+			_, found := c.item[name]
+			c.mu.Unlock()
+			if found {
+				return nil
 			}
+			mu.Lock()
+			i := len(names)
+			names = append(names, name)
+			items = append(items, nil)
+			mu.Unlock()
+			g.Go(func() error {
+				// newItem does the IO - it must not be called under c.mu
+				item := newItem(c, name)
+				mu.Lock()
+				items[i] = item
+				mu.Unlock()
+				return gCtx.Err()
+			})
 			return nil
 		})
-		if err != nil {
-			return fmt.Errorf("failed to walk cache %q: %w", dir, err)
+		if err := g.Wait(); err != nil && walkErr == nil {
+			walkErr = err
+		}
+		if walkErr != nil {
+			return fmt.Errorf("failed to walk cache %q: %w", dir, walkErr)
+		}
+		for i, name := range names {
+			c.mu.Lock()
+			c.item[name] = items[i]
+			c.mu.Unlock()
+			if err := items[i].reload(ctx); err != nil {
+				fs.Errorf(name, "vfs cache: failed to reload item: %v", err)
+			}
 		}
 	}
 	return nil

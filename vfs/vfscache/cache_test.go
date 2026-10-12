@@ -2,6 +2,7 @@ package vfscache
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -753,4 +754,106 @@ func TestCacheQueueSetExpiry(t *testing.T) {
 	// writeback.
 	err := c.QueueSetExpiry(123123, time.Now(), 0)
 	assert.Equal(t, writeback.ErrorIDNotFound, err)
+}
+
+// reloadCache makes a new Cache over the same remote - and so the same
+// cache directory - as an existing one, which makes New load whatever
+// is already on disk.
+func reloadCache(t *testing.T, r *fstest.Run, opt vfscommon.Options) *Cache {
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	avInfos = nil
+	c, err := New(ctx, r.Fremote, &opt, addVirtual)
+	require.NoError(t, err)
+	return c
+}
+
+// fill the cache with n items which each have a data and a metadata file
+func fillCache(t *testing.T, c *Cache, n int) {
+	for i := 0; i < n; i++ {
+		name := fmt.Sprintf("dir%02d/file%03d", i%7, i)
+		item := c.Item(name)
+		itemWrite(t, item, fmt.Sprintf("contents of %s", name))
+		require.NoError(t, item.Close(nil))
+	}
+}
+
+// reload used to create every item under c.mu, one at a time. Each one
+// stats its data file and reads and decodes its metadata file, so on a
+// cache directory with any latency - NFS, say - starting a large cache
+// took minutes, with the mount unavailable throughout. The items are
+// created concurrently and off c.mu now, so check that the parallel
+// and the serial paths agree on what they load.
+func TestCacheReloadConcurrency(t *testing.T) {
+	opt := vfscommon.Opt
+	opt.CachePollInterval = 0
+	opt.WriteBack = 0
+	opt.HandleCaching = 0
+
+	r, c := newTestCacheOpt(t, opt)
+
+	const items = 100
+	fillCache(t, c, items)
+	want := itemAsString(c)
+	require.Len(t, want, items)
+
+	// Loading the same cache directory again must find exactly the
+	// same items however many workers do it.
+	for _, concurrency := range []int{0, 1, 2, 64} {
+		t.Run(fmt.Sprintf("concurrency=%d", concurrency), func(t *testing.T) {
+			opt := opt
+			opt.CacheReloadConcurrency = concurrency
+			got := itemAsString(reloadCache(t, r, opt))
+			assert.Equal(t, want, got)
+		})
+	}
+}
+
+// markDirty flips the Dirty flag in an item's metadata file on disk,
+// so a later reload sees it as needing writing back.
+func markDirty(t *testing.T, c *Cache, name string) {
+	osPathMeta := c.toOSPathMeta(name)
+	buf, err := os.ReadFile(osPathMeta)
+	require.NoError(t, err)
+	var info Info
+	require.NoError(t, json.Unmarshal(buf, &info))
+	info.Dirty = true
+	buf, err = json.Marshal(&info)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(osPathMeta, buf, 0600))
+}
+
+// reload creates the items concurrently but then hands them to
+// item.reload serially, in walk order, so that writing back the dirty
+// ones is sequenced exactly as it was before. item.reload calls
+// AddVirtual for each dirty item, so check those arrive in order.
+func TestCacheReloadDirtyOrder(t *testing.T) {
+	opt := vfscommon.Opt
+	opt.CachePollInterval = 0
+	opt.WriteBack = 0
+	opt.HandleCaching = 0
+
+	r, c := newTestCacheOpt(t, opt)
+
+	const items = 50
+	fillCache(t, c, items)
+
+	// Dirty a scattered handful so walk order and creation order differ
+	var dirty []string
+	for i := 0; i < items; i += 6 {
+		name := fmt.Sprintf("dir%02d/file%03d", i%7, i)
+		markDirty(t, c, name)
+		dirty = append(dirty, name)
+	}
+	sort.Strings(dirty)
+	require.Greater(t, len(dirty), 1)
+
+	opt.CacheReloadConcurrency = 64
+	reloadCache(t, r, opt)
+
+	got := make([]string, 0, len(avInfos))
+	for _, av := range avInfos {
+		got = append(got, filepath.ToSlash(av.Remote))
+	}
+	assert.Equal(t, dirty, got)
 }
