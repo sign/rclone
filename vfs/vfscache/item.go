@@ -131,6 +131,18 @@ type StoreFn func(fs.Object)
 
 // newItem returns an item for the cache
 func newItem(c *Cache, name string) (item *Item) {
+	return newItemEx(c, name, true)
+}
+
+// newItemEx creates an empty Item for the cache file at name.
+//
+// If tidy is false it will not delete anything it finds inconsistent. The
+// background scan started by --vfs-cache-reload-async runs against a live
+// mount, and an item the VFS is part way through creating looks exactly like
+// an inconsistent one: Item.open writes the data file before the metadata, and
+// _save truncates the metadata before rewriting it. Tidying either of those
+// away would destroy a cache file that is in use.
+func newItemEx(c *Cache, name string, tidy bool) (item *Item) {
 	now := time.Now()
 	item = &Item{
 		c:    c,
@@ -146,8 +158,10 @@ func newItem(c *Cache, name string) (item *Item) {
 	fi, statErr := os.Stat(osPath)
 	if statErr != nil {
 		if os.IsNotExist(statErr) {
-			item._removeMeta("cache file doesn't exist")
-		} else {
+			if tidy {
+				item._removeMeta("cache file doesn't exist")
+			}
+		} else if tidy {
 			item.remove(fmt.Sprintf("failed to stat cache file: %v", statErr))
 		}
 	}
@@ -155,8 +169,10 @@ func newItem(c *Cache, name string) (item *Item) {
 	// Try to load the metadata
 	exists, err := item.load()
 	if !exists {
-		item._removeFile("metadata doesn't exist")
-	} else if err != nil {
+		if tidy {
+			item._removeFile("metadata doesn't exist")
+		}
+	} else if err != nil && tidy {
 		item.remove(fmt.Sprintf("failed to load metadata: %v", err))
 	}
 
@@ -839,7 +855,9 @@ func (item *Item) reload(ctx context.Context) error {
 		return err
 	}
 	// put the file into the directory listings
+	item.mu.Lock()
 	size, err := item._getSize()
+	item.mu.Unlock()
 	if err != nil {
 		return fmt.Errorf("reload: failed to read size: %w", err)
 	}

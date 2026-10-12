@@ -5,7 +5,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path"
 	"path/filepath"
@@ -13,6 +12,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/rclone/rclone/fs"
@@ -64,6 +64,20 @@ type Cache struct {
 	kickerMu      sync.Mutex       // mutex for cleanerKicked
 	kick          chan struct{}    // channel for kicking clear to start
 
+	// dirtyNotWrittenBack counts items an async reload found dirty and
+	// deliberately did not write back - see reload. Written during the scan
+	// and read afterwards, so it is atomic rather than under mu.
+	dirtyNotWrittenBack atomic.Int64
+}
+
+// DirtyNotWrittenBack returns how many items the cache load found dirty but
+// did not write back. This is only ever non-zero with
+// --vfs-cache-reload-async, which does no writeback: see reload.
+//
+// It is best effort: the mount is live while the scan runs, so an item the
+// VFS reuses before the scan reaches it is not counted.
+func (c *Cache) DirtyNotWrittenBack() int64 {
+	return c.dirtyNotWrittenBack.Load()
 }
 
 // AddVirtualFn if registered by the WithAddVirtual method, can be
@@ -144,15 +158,29 @@ func New(ctx context.Context, fremote fs.Fs, opt *vfscommon.Options, avFn AddVir
 	// finishes. With --vfs-cache-reload-async it runs in the background
 	// instead: items not scanned yet are picked up off disk when they are
 	// first opened, so the cache is still used, but the size the cleaner
-	// enforces quotas against only becomes accurate once the scan completes.
+	// enforces quotas against only becomes accurate once the scan completes,
+	// and the scan does no writeback (see reload). Options.Init has already
+	// refused the flag unless the mount is read-only.
 	if opt.CacheReloadAsync {
 		go func() {
 			if err := c.reload(ctx); err != nil {
-				fs.Errorf(fremote, "vfs cache: failed to load cache: %v", err)
+				if errors.Is(err, context.Canceled) {
+					// normal shutdown part way through the scan
+					fs.Debugf(fremote, "vfs cache: cache load cancelled")
+				} else {
+					fs.Errorf(fremote, "vfs cache: failed to load cache: %v", err)
+				}
 				return
 			}
-			c.purgeEmptyDirs("", true)
-			fs.Infof(fremote, "vfs cache: loaded %d items", c.TotalItems())
+			// purgeEmptyDirs is deliberately not run here. It removes
+			// directories, and by this point the mount is live and creating
+			// them - Item.open creates an item's parent before its file, so
+			// a purge landing between the two turns a read into an error.
+			if n := c.DirtyNotWrittenBack(); n > 0 {
+				fs.Logf(fremote, "vfs cache: loaded %d items, %d dirty and NOT written back - remount read-write to flush them", c.TotalItems(), n)
+			} else {
+				fs.Infof(fremote, "vfs cache: loaded %d items", c.TotalItems())
+			}
 		}()
 	} else {
 		if err = c.reload(ctx); err != nil {
@@ -531,6 +559,28 @@ func (c *Cache) CleanUp() error {
 	return err2
 }
 
+// readDirNames reads every name in a directory, closing it before returning.
+//
+// The directory must not be left open while its children are walked: when the
+// worker pool is saturated the walk runs inline, so an open fd per level
+// nests, and a deep tree at high concurrency then runs out of file
+// descriptors. On EMFILE a synchronous load fails New entirely, and
+// SetCacheMode turns that into a mount with no cache at all.
+func readDirNames(osPath string) (names []string, err error) {
+	f, err := os.Open(osPath)
+	if err != nil {
+		return nil, err
+	}
+	// names only - no Lstat, so a directory of a million entries lists in
+	// milliseconds. -1 reads them all and reports no io.EOF.
+	names, err = f.Readdirnames(-1)
+	if closeErr := f.Close(); closeErr != nil {
+		// not worth failing the whole cache load over
+		fs.Errorf(osPath, "vfs cache: failed to close cache directory: %v", closeErr)
+	}
+	return names, err
+}
+
 // walk walks the cache calling fn for each entry found, with up to
 // concurrency entries being processed at once.
 //
@@ -539,7 +589,12 @@ func (c *Cache) CleanUp() error {
 // a high latency cache directory is by far the most expensive part, and is
 // what filepath.Walk does serially on the calling goroutine - is then done by
 // the workers. fn may be called concurrently from several goroutines.
-func (c *Cache) walk(dir string, concurrency int, fn func(osPath string, fi os.FileInfo, name string) error) error {
+//
+// It stops early if ctx is cancelled and returns ctx.Err(). A walk of a large
+// cache on slow storage runs for a long time, and with
+// --vfs-cache-reload-async it outlives the call to New, so it must not keep
+// going after the cache it is filling has been shut down.
+func (c *Cache) walk(ctx context.Context, dir string, concurrency int, fn func(osPath string, fi os.FileInfo, name string) error) error {
 	if concurrency < 1 {
 		concurrency = 1
 	}
@@ -561,9 +616,19 @@ func (c *Cache) walk(dir string, concurrency int, fn func(osPath string, fi os.F
 	var walkDir func(osPath, name string)
 
 	visit = func(osPath, name string) {
+		if err := ctx.Err(); err != nil {
+			setErr(err)
+			return
+		}
 		fi, err := os.Lstat(osPath)
 		if err != nil {
-			setErr(err)
+			// An entry that went away between listing the directory and
+			// stat'ing it is not a failure: the cleaner unlinks cache files,
+			// and with --vfs-cache-reload-async it does so while this walk is
+			// still running. Failing here would abandon the rest of the scan.
+			if !os.IsNotExist(err) {
+				setErr(err)
+			}
 			return
 		}
 		if err := fn(osPath, fi, name); err != nil {
@@ -576,52 +641,51 @@ func (c *Cache) walk(dir string, concurrency int, fn func(osPath string, fi os.F
 	}
 
 	walkDir = func(osPath, name string) {
-		f, err := os.Open(osPath)
-		if err != nil {
+		if err := ctx.Err(); err != nil {
 			setErr(err)
 			return
 		}
-		defer func() {
-			setErr(f.Close())
-		}()
-		for {
-			// names only - no Lstat, so a directory with a million
-			// entries lists in milliseconds
-			names, err := f.Readdirnames(1024)
-			for _, n := range names {
-				childOSPath := filepath.Join(osPath, n)
-				childName := n
-				if name != "" {
-					childName = name + "/" + n
-				}
-				wg.Add(1)
-				run := func() {
-					defer wg.Done()
-					visit(childOSPath, childName)
-				}
-				// Take a worker slot if one is free, otherwise do the
-				// work inline. Blocking here instead would deadlock
-				// once every worker is itself waiting for a slot.
-				select {
-				case sem <- struct{}{}:
-					go func() {
-						defer func() { <-sem }()
-						run()
-					}()
-				default:
-					run()
-				}
+		names, err := readDirNames(osPath)
+		if err != nil {
+			if !os.IsNotExist(err) { // removed under us - see visit
+				setErr(err)
 			}
-			if err != nil {
-				if err != io.EOF {
-					setErr(err)
-				}
+			return
+		}
+		for _, n := range names {
+			if cerr := ctx.Err(); cerr != nil {
+				setErr(cerr)
 				return
+			}
+			childOSPath := filepath.Join(osPath, n)
+			childName := n
+			if name != "" {
+				childName = name + "/" + n
+			}
+			wg.Add(1)
+			run := func() {
+				defer wg.Done()
+				visit(childOSPath, childName)
+			}
+			// Take a worker slot if one is free, otherwise do the work
+			// inline. Blocking here instead would deadlock once every
+			// worker is itself waiting for a slot.
+			select {
+			case sem <- struct{}{}:
+				go func() {
+					defer func() { <-sem }()
+					run()
+				}()
+			default:
+				run()
 			}
 		}
 	}
 
 	// the root itself, matching filepath.Walk which visits it first
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	rootFi, err := os.Lstat(dir)
 	if err != nil {
 		return err
@@ -648,29 +712,68 @@ func (c *Cache) walk(dir string, concurrency int, fn func(osPath string, fi os.F
 //
 // The items are then passed to item.reload serially, in sorted order, so that
 // writing back any dirty ones is sequenced deterministically.
+//
+// With --vfs-cache-reload-async the mount is already serving by the time this
+// runs, so item.reload is skipped entirely - it opens and closes the item to
+// drive writeback, which would race the VFS's own handles. Any item found
+// dirty is logged rather than written back. Options.Init only allows that flag
+// on a read-only mount, so the only way to reach it is a cache left dirty by
+// an earlier read-write session.
 func (c *Cache) reload(ctx context.Context) error {
+	// Items found dirty by an async scan are reported, not written back - see
+	// below. Both tree passes can reach the same name, so remember which have
+	// been mentioned.
+	var (
+		warnedMu sync.Mutex
+		warned   = map[string]bool{}
+	)
+	warnDirty := func(item *Item) {
+		if !c.opt.CacheReloadAsync || !item.IsDirty() {
+			return
+		}
+		warnedMu.Lock()
+		already := warned[item.name]
+		warned[item.name] = true
+		warnedMu.Unlock()
+		if !already {
+			c.dirtyNotWrittenBack.Add(1)
+			fs.Logf(item.name, "vfs cache: dirty item not written back and not listed on the mount: loaded with --vfs-cache-reload-async, remount read-write to flush it")
+		}
+	}
+
 	for _, dir := range []string{c.root, c.metaRoot} {
 		var (
 			mu    sync.Mutex
 			found []*Item
 		)
-		err := c.walk(dir, c.opt.CacheReloadConcurrency, func(osPath string, fi os.FileInfo, name string) error {
+		walkErr := c.walk(ctx, dir, c.opt.CacheReloadConcurrency, func(osPath string, fi os.FileInfo, name string) error {
 			if fi.IsDir() {
 				return nil
 			}
 			name = clean(name)
 			c.mu.Lock()
-			_, exists := c.item[name]
+			existing, exists := c.item[name]
 			c.mu.Unlock()
 			if exists {
-				// the metaRoot walk revisits what the root walk loaded
+				// Either the metaRoot walk revisiting what the root walk
+				// loaded, or - on a live async mount - an entry the VFS put
+				// there itself by probing the path. Cache.Exists and
+				// Cache.Item both do that, and vfs.File.Open calls Exists on
+				// every open, so this is the common case, not a rare one.
+				// Don't take the item over, but a dirty one still has to be
+				// reported or it goes unflushed and unmentioned.
+				warnDirty(existing)
 				return nil
 			}
-			// newItem does the IO - deliberately not under c.mu
-			item := newItem(c, name)
+			// newItem does the IO - deliberately not under c.mu. An async
+			// scan must not tidy up what looks inconsistent: the mount is
+			// live, so it may just be an item the VFS is mid-way through
+			// creating.
+			item := newItemEx(c, name, !c.opt.CacheReloadAsync)
 			c.mu.Lock()
-			if _, dup := c.item[name]; dup {
+			if existing, dup := c.item[name]; dup {
 				c.mu.Unlock()
+				warnDirty(existing)
 				return nil
 			}
 			c.item[name] = item
@@ -680,14 +783,29 @@ func (c *Cache) reload(ctx context.Context) error {
 			mu.Unlock()
 			return nil
 		})
-		if err != nil {
-			return fmt.Errorf("failed to walk cache %q: %w", dir, err)
-		}
+		// Reload what the walk did find before reporting the failure. The
+		// walk carries on past an error, so a single transient Lstat could
+		// otherwise leave a fully populated c.item with nothing written
+		// back - worse than the old inline filepath.Walk, which at least
+		// reloaded everything it reached before giving up.
 		sort.Slice(found, func(i, j int) bool { return found[i].name < found[j].name })
 		for _, item := range found {
+			if c.opt.CacheReloadAsync {
+				// The mount is already live, so driving writeback from here
+				// is not safe: item.reload opens and closes the item, which
+				// races whatever handles the VFS holds. Skipping it is also
+				// not something to do quietly - an item dirtied by an
+				// earlier read-write session would never be written back -
+				// so say so instead of losing it silently.
+				warnDirty(item)
+				continue
+			}
 			if err := item.reload(ctx); err != nil {
 				fs.Errorf(item.name, "vfs cache: failed to reload item: %v", err)
 			}
+		}
+		if walkErr != nil {
+			return fmt.Errorf("failed to walk cache %q: %w", dir, walkErr)
 		}
 	}
 	return nil

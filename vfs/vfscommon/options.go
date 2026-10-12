@@ -78,12 +78,12 @@ var OptionsInfo = fs.Options{{
 }, {
 	Name:    "vfs_cache_reload_concurrency",
 	Default: 16,
-	Help:    "Number of checkers to use when loading the cache at startup",
+	Help:    "Number of workers to use when loading the cache at startup",
 	Groups:  "VFS",
 }, {
 	Name:    "vfs_cache_reload_async",
 	Default: false,
-	Help:    "Load the cache in the background, so the mount is usable immediately",
+	Help:    "Load the cache in the background so the mount is usable immediately (requires --read-only; no writeback, orphan cleanup or accurate quota until it finishes)",
 	Groups:  "VFS",
 }, {
 	Name:    "vfs_read_chunk_size",
@@ -252,4 +252,28 @@ func (opt *Options) Init(ctx context.Context) {
 
 	// Make sure links are returned as links
 	opt.LinkPerms |= FileMode(os.ModeSymlink)
+
+	// Loading the cache in the background is only safe on a read-only mount -
+	// see the comment on reload. Refuse it rather than load asynchronously
+	// and quietly skip the writeback of items that were already dirty on
+	// disk. This can't be reported by failing vfscache.New: SetCacheMode
+	// turns that into "disable the cache and carry on", which would leave a
+	// mount with no cache at all over a flag mistake.
+	if opt.CacheReloadAsync && !opt.ReadOnly {
+		fs.Errorf(nil, "vfs cache: ignoring --vfs-cache-reload-async: it requires --read-only")
+		opt.CacheReloadAsync = false
+	}
+
+	// An unbounded worker count would be a goroutine and file descriptor per
+	// cache entry; past a point more workers only make the cache directory
+	// slower anyway.
+	if opt.CacheReloadConcurrency < 1 {
+		opt.CacheReloadConcurrency = 1
+	} else if opt.CacheReloadConcurrency > maxCacheReloadConcurrency {
+		fs.Errorf(nil, "vfs cache: limiting --vfs-cache-reload-concurrency to %d", maxCacheReloadConcurrency)
+		opt.CacheReloadConcurrency = maxCacheReloadConcurrency
+	}
 }
+
+// maxCacheReloadConcurrency caps --vfs-cache-reload-concurrency
+const maxCacheReloadConcurrency = 1024

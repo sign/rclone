@@ -4,9 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -75,9 +78,16 @@ type avInfo struct {
 	IsDir  bool
 }
 
-var avInfos []avInfo
+// avInfos is written by addVirtual, which the background reload goroutine can
+// call, so it needs a lock - read it with getAvInfos, never directly.
+var (
+	avInfosMu sync.Mutex
+	avInfos   []avInfo
+)
 
 func addVirtual(remote string, size int64, isDir bool) error {
+	avInfosMu.Lock()
+	defer avInfosMu.Unlock()
 	avInfos = append(avInfos, avInfo{
 		Remote: remote,
 		Size:   size,
@@ -86,12 +96,29 @@ func addVirtual(remote string, size int64, isDir bool) error {
 	return nil
 }
 
+// getAvInfos returns the remotes passed to addVirtual so far, sorted
+func getAvInfos() []string {
+	avInfosMu.Lock()
+	defer avInfosMu.Unlock()
+	out := make([]string, 0, len(avInfos))
+	for _, av := range avInfos {
+		out = append(out, filepath.ToSlash(av.Remote))
+	}
+	return out
+}
+
+func resetAvInfos() {
+	avInfosMu.Lock()
+	defer avInfosMu.Unlock()
+	avInfos = nil
+}
+
 func newTestCacheOpt(t *testing.T, opt vfscommon.Options) (r *fstest.Run, c *Cache) {
 	r = fstest.NewRun(t)
 
 	ctx, cancel := context.WithCancel(context.Background())
 
-	avInfos = nil
+	resetAvInfos()
 	c, err := New(ctx, r.Fremote, &opt, addVirtual)
 	require.NoError(t, err)
 
@@ -762,7 +789,7 @@ func TestCacheQueueSetExpiry(t *testing.T) {
 func reloadCache(t *testing.T, r *fstest.Run, opt vfscommon.Options) *Cache {
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
-	avInfos = nil
+	resetAvInfos()
 	c, err := New(ctx, r.Fremote, &opt, addVirtual)
 	require.NoError(t, err)
 	return c
@@ -851,17 +878,12 @@ func TestCacheReloadDirtyOrder(t *testing.T) {
 	opt.CacheReloadConcurrency = 64
 	reloadCache(t, r, opt)
 
-	got := make([]string, 0, len(avInfos))
-	for _, av := range avInfos {
-		got = append(got, filepath.ToSlash(av.Remote))
-	}
-	assert.Equal(t, dirty, got)
+	assert.Equal(t, dirty, getAvInfos())
 }
 
 // With --vfs-cache-reload-async the cache scan runs in the background, so New
-// returns before it has finished. Items it has not reached yet must still be
-// picked up off disk when they are opened, otherwise the cache would look
-// empty until the scan completed.
+// returns before it has finished. An item the scan has not reached yet must
+// still be usable, because Cache.Item builds it from what is on disk.
 func TestCacheReloadAsync(t *testing.T) {
 	opt := vfscommon.Opt
 	opt.CachePollInterval = 0
@@ -876,9 +898,26 @@ func TestCacheReloadAsync(t *testing.T) {
 	require.Len(t, want, items)
 
 	opt.CacheReloadAsync = true
+	opt.ReadOnly = true // async loading is only allowed read-only
 	async := reloadCache(t, r, opt)
 
-	// The scan races with us by design, so wait for it to converge.
+	// Usable before the scan has necessarily reached it. Check the contents,
+	// not that Item returned something - Item never returns nil. Open with
+	// the real object: Open(nil) means "no remote object" and truncates.
+	const name = "dir00/file000"
+	obj, err := r.Fremote.NewObject(context.Background(), name)
+	require.NoError(t, err)
+	item := async.Item(name)
+	require.NoError(t, item.Open(obj))
+	buf := make([]byte, 64)
+	n, err := item.ReadAt(buf, 0)
+	require.NoError(t, item.Close(nil))
+	if err != nil && err != io.EOF { // short read at EOF is expected
+		require.NoError(t, err)
+	}
+	assert.Equal(t, "contents of "+name, string(buf[:n]))
+
+	// and the scan converges on the same set the synchronous path finds
 	for range 100 {
 		if len(itemAsString(async)) == items {
 			break
@@ -886,10 +925,321 @@ func TestCacheReloadAsync(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 	assert.Equal(t, want, itemAsString(async))
+}
 
-	// An item is usable regardless of whether the scan reached it, because
-	// Item() builds it from what is on disk.
-	item := async.Item("dir00/file000")
-	require.NotNil(t, item)
-	assert.True(t, async.Exists("dir00/file000"))
+// A cache left dirty by an earlier read-write session is not written back by
+// the async scan - item.reload would race the live mount's handles - but it
+// must not be dropped silently either, and the item must still be present.
+func TestCacheReloadAsyncDirtyNotSilentlyDropped(t *testing.T) {
+	opt := vfscommon.Opt
+	opt.CachePollInterval = 0
+	opt.WriteBack = 0
+	opt.HandleCaching = 0
+
+	r, c := newTestCacheOpt(t, opt)
+
+	const items = 20
+	fillCache(t, c, items)
+	name := "dir00/file000"
+	markDirty(t, c, name)
+
+	opt.CacheReloadAsync = true
+	opt.ReadOnly = true
+	async := reloadCache(t, r, opt)
+
+	for range 100 {
+		if len(itemAsString(async)) == items {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	// the scan found it ...
+	assert.Len(t, itemAsString(async), items)
+	// ... and deliberately did not drive writeback from a live mount
+	assert.Empty(t, getAvInfos(), "async reload must not write back dirty items")
+	assert.Equal(t, int64(1), async.DirtyNotWrittenBack(), "the dirty item must be reported")
+	_ = name
+}
+
+// The dangerous shape of the above: the live mount probes the path before the
+// scan reaches it. Cache.Exists inserts into c.item, so the scan then finds
+// the name already present - and must still notice it is dirty rather than
+// passing over it in silence, which is the whole point of the warning.
+func TestCacheReloadAsyncDirtyProbedFirst(t *testing.T) {
+	opt := vfscommon.Opt
+	opt.CachePollInterval = 0
+	opt.WriteBack = 0
+	opt.HandleCaching = 0
+
+	r, c := newTestCacheOpt(t, opt)
+
+	const items = 20
+	fillCache(t, c, items)
+	const name = "dir00/file000"
+	markDirty(t, c, name)
+
+	// Build the cache by hand so we can probe before reload runs, exactly as
+	// a live mount would.
+	opt.CacheReloadAsync = true
+	opt.ReadOnly = true
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	resetAvInfos()
+
+	probed, err := New(ctx, r.Fremote, &opt, addVirtual)
+	require.NoError(t, err)
+	// race the scan: whether we win or lose, the item must not be passed over
+	// silently - if we win, reload sees it already in c.item
+	probed.Exists(name)
+
+	for range 100 {
+		if len(itemAsString(probed)) == items {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	item := probed.Item(name)
+	assert.True(t, item.IsDirty(), "the item must still be known to be dirty")
+	assert.Empty(t, getAvInfos(), "async reload must not write back dirty items")
+	// and crucially it was reported rather than passed over in silence
+	assert.Equal(t, int64(1), probed.DirtyNotWrittenBack(),
+		"a dirty item the VFS probed first must still be reported")
+}
+
+// The cleaner unlinks cache files while an async scan is walking, so an entry
+// that disappears between Readdirnames and Lstat must not fail the scan.
+func TestCacheReloadWalkToleratesVanishedEntry(t *testing.T) {
+	opt := vfscommon.Opt
+	opt.CachePollInterval = 0
+	opt.WriteBack = 0
+	opt.HandleCaching = 0
+
+	_, c := newTestCacheOpt(t, opt)
+
+	dir := filepath.Join(c.root, "flat")
+	require.NoError(t, os.MkdirAll(dir, 0700))
+	const items = 200
+	for i := range items {
+		require.NoError(t, os.WriteFile(filepath.Join(dir, fmt.Sprintf("f%05d", i)), nil, 0600))
+	}
+
+	// Delete entries behind the walk, the way the cleaner would.
+	var seen atomic.Int64
+	err := c.walk(context.Background(), c.root, 1, func(osPath string, fi os.FileInfo, name string) error {
+		if fi.IsDir() {
+			return nil
+		}
+		if seen.Add(1) == 1 {
+			// remove a batch the walk has listed but not yet stat'ed
+			for i := items - 50; i < items; i++ {
+				_ = os.Remove(filepath.Join(dir, fmt.Sprintf("f%05d", i)))
+			}
+		}
+		return nil
+	})
+	require.NoError(t, err, "a vanished entry must not fail the walk")
+	assert.Greater(t, seen.Load(), int64(100), "the walk should have carried on")
+}
+
+// The background scan outlives New, so cancelling the cache context has to
+// stop it part-way through - otherwise it keeps walking a cache that has been
+// shut down.
+//
+// The entries are deliberately in one flat directory, because that is the
+// shape that matters: the cache this was written for holds >1M entries in a
+// single directory, and there the per-entry check is the only thing that stops
+// the walk promptly. The per-directory check never fires again, and the
+// per-batch check only every Readdirnames batch.
+func TestCacheReloadCancelMidWalk(t *testing.T) {
+	opt := vfscommon.Opt
+	opt.CachePollInterval = 0
+	opt.WriteBack = 0
+	opt.HandleCaching = 0
+
+	_, c := newTestCacheOpt(t, opt)
+
+	const items = 4000 // several Readdirnames batches worth
+	dir := filepath.Join(c.root, "flat")
+	require.NoError(t, os.MkdirAll(dir, 0700))
+	for i := range items {
+		require.NoError(t, os.WriteFile(filepath.Join(dir, fmt.Sprintf("f%05d", i)), nil, 0600))
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var seen atomic.Int64
+	err := c.walk(ctx, c.root, 4, func(osPath string, fi os.FileInfo, name string) error {
+		if seen.Add(1) == 10 {
+			cancel() // cancel once we are genuinely under way
+		}
+		return nil
+	})
+	require.ErrorIs(t, err, context.Canceled)
+
+	n := seen.Load()
+	assert.Greater(t, n, int64(0), "walk should have started")
+	// Without a per-entry check the whole first batch is dispatched before
+	// anything notices, so this would be >= 1024.
+	assert.Less(t, n, int64(512), "walk should have stopped promptly, visited %d of %d", n, items)
+}
+
+// A failing walk must not cost us the writeback of the items it did find.
+// reload used to return as soon as walk did, and because walk carries on past
+// an error it could populate the whole of c.item and then reload none of it -
+// worse than the inline filepath.Walk it replaced.
+func TestCacheReloadWalkErrorStillReloads(t *testing.T) {
+	opt := vfscommon.Opt
+	opt.CachePollInterval = 0
+	opt.WriteBack = 0
+	opt.HandleCaching = 0
+
+	r, c := newTestCacheOpt(t, opt)
+
+	const items = 20
+	fillCache(t, c, items)
+	var dirty []string
+	for i := 0; i < items; i += 4 {
+		name := fmt.Sprintf("dir%02d/file%03d", i%7, i)
+		markDirty(t, c, name)
+		dirty = append(dirty, name)
+	}
+	sort.Strings(dirty)
+	require.NotEmpty(t, dirty)
+
+	// An unreadable directory makes the walk fail partway through.
+	bad := filepath.Join(c.root, "unreadable")
+	require.NoError(t, os.MkdirAll(bad, 0700))
+	require.NoError(t, os.Chmod(bad, 0000))
+	t.Cleanup(func() { _ = os.Chmod(bad, 0700) })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	resetAvInfos()
+	opt.CacheReloadConcurrency = 8
+	failed, err := New(ctx, r.Fremote, &opt, addVirtual)
+	if err == nil {
+		t.Skip("walk did not fail - running as a user that can read 0000 dirs")
+	}
+	assert.Nil(t, failed)
+
+	// Every dirty item the walk reached must still have been written back.
+	got := getAvInfos()
+	sort.Strings(got)
+	assert.Equal(t, dirty, got)
+}
+
+// walk returns immediately when handed a context that is already cancelled.
+// This only covers the guard before the root is read - cancellation part-way
+// through a walk is TestCacheReloadCancelMidWalk.
+func TestCacheReloadCancelAtStart(t *testing.T) {
+	opt := vfscommon.Opt
+	opt.CachePollInterval = 0
+	opt.WriteBack = 0
+	opt.HandleCaching = 0
+
+	_, c := newTestCacheOpt(t, opt)
+	fillCache(t, c, 20)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // already cancelled before the walk starts
+
+	err := c.walk(ctx, c.root, 4, func(osPath string, fi os.FileInfo, name string) error {
+		return nil
+	})
+	assert.ErrorIs(t, err, context.Canceled)
+}
+
+// newItem deletes what looks inconsistent: a data file with no metadata is
+// treated as an orphan. On a live mount that shape is also what Item.open
+// leaves behind between writing the data file and writing its metadata, so an
+// async scan must not tidy it away - it would destroy a cache file in use.
+// A synchronous load runs before anything is mounted, so it still cleans up.
+func TestCacheReloadAsyncDoesNotTidyLiveItems(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		async       bool
+		wantRemoved bool
+	}{
+		{name: "sync tidies orphans", async: false, wantRemoved: true},
+		{name: "async leaves them alone", async: true, wantRemoved: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			opt := vfscommon.Opt
+			opt.CachePollInterval = 0
+			opt.WriteBack = 0
+			opt.HandleCaching = 0
+
+			r, c := newTestCacheOpt(t, opt)
+			fillCache(t, c, 5)
+
+			// a data file whose metadata has not been written yet
+			const name = "dir00/file000"
+			require.NoError(t, os.Remove(c.toOSPathMeta(name)))
+			dataPath := c.toOSPath(name)
+			_, err := os.Stat(dataPath)
+			require.NoError(t, err, "data file should still be there")
+
+			opt.CacheReloadAsync = test.async
+			opt.ReadOnly = test.async // async is only allowed read-only
+			reloaded := reloadCache(t, r, opt)
+			for range 100 {
+				if len(itemAsString(reloaded)) >= 4 {
+					break
+				}
+				time.Sleep(50 * time.Millisecond)
+			}
+
+			_, err = os.Stat(dataPath)
+			if test.wantRemoved {
+				assert.True(t, os.IsNotExist(err), "sync load should have removed the orphan, got %v", err)
+			} else {
+				assert.NoError(t, err, "async load must not delete a data file that may be mid-create")
+			}
+		})
+	}
+}
+
+// countOpenFDs returns how many file descriptors this process has open.
+func countOpenFDs(t *testing.T) int {
+	ents, err := os.ReadDir("/proc/self/fd")
+	if err != nil {
+		t.Skip("no /proc/self/fd on this platform")
+	}
+	return len(ents)
+}
+
+// walk must not keep a directory open while descending into it. When the
+// worker pool is saturated the walk runs inline, so holding the fd would nest
+// one per level of the tree, and a deep tree would exhaust the fd table -
+// which on a synchronous load fails New and leaves the mount with no cache.
+func TestCacheReloadWalkDoesNotNestDirFDs(t *testing.T) {
+	opt := vfscommon.Opt
+	opt.CachePollInterval = 0
+	opt.WriteBack = 0
+	opt.HandleCaching = 0
+
+	_, c := newTestCacheOpt(t, opt)
+
+	// one deep chain, so every level is entered while the previous is open
+	const depth = 300
+	dir := c.root
+	for i := range depth {
+		dir = filepath.Join(dir, fmt.Sprintf("d%03d", i))
+	}
+	require.NoError(t, os.MkdirAll(dir, 0700))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "leaf"), nil, 0600))
+
+	base := countOpenFDs(t)
+	var peak atomic.Int64
+	err := c.walk(context.Background(), c.root, 1, func(osPath string, fi os.FileInfo, name string) error {
+		if n := int64(countOpenFDs(t) - base); n > peak.Load() {
+			peak.Store(n)
+		}
+		return nil
+	})
+	require.NoError(t, err)
+	// Holding the fd open across the descent gives roughly one per level.
+	assert.Less(t, peak.Load(), int64(depth/4),
+		"walk held %d extra fds descending %d levels", peak.Load(), depth)
 }
