@@ -10,6 +10,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/dirtree"
@@ -894,7 +895,9 @@ func (d *Dir) stat(leaf string) (Node, error) {
 	ci := fs.GetConfig(d.vfs.ctx)
 	normUnicode := !ci.NoUnicodeNormalization
 	normCase := ci.IgnoreCaseSync || d.vfs.Opt.CaseInsensitive
-	if !ok && (normUnicode || normCase) {
+	// skip the O(items) scan when no other name can normalize to leaf: on a
+	// 3.3M-entry dir each miss otherwise holds d.mu for ~1s and wedges the mount
+	if !ok && (normCase || (normUnicode && !nfcUnique(leaf))) {
 		leafNormalized := operations.ToNormal(leaf, normUnicode, normCase) // this handles both case and unicode normalization
 		d.mu.Lock()
 		for name, node := range d.items {
@@ -916,6 +919,18 @@ func (d *Dir) stat(leaf string) (Node, error) {
 		return nil, ENOENT
 	}
 	return item, nil
+}
+
+// nfcUnique reports whether no string other than s NFC-normalizes to s: true for
+// ASCII without ';', '`' and 'K', the only ASCII targets of non-ASCII runes
+// (the canonical singletons U+037E, U+1FEF, U+212A). TestNFCUnique checks this.
+func nfcUnique(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if c := s[i]; c >= utf8.RuneSelf || c == ';' || c == '`' || c == 'K' {
+			return false
+		}
+	}
+	return true
 }
 
 // Check to see if a directory is empty

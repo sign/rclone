@@ -10,6 +10,8 @@ import (
 	"sort"
 	"testing"
 	"time"
+	"unicode"
+	"unicode/utf8"
 	"unsafe"
 
 	"github.com/rclone/rclone/fs"
@@ -17,6 +19,7 @@ import (
 	"github.com/rclone/rclone/fstest"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/text/unicode/norm"
 )
 
 func dirCreate(t *testing.T) (r *fstest.Run, vfs *VFS, dir *Dir, item fstest.Item) {
@@ -762,4 +765,20 @@ func TestDirMetadataExtension(t *testing.T) {
 	if features.ReadDirMetadata {
 		assert.Equal(t, modTime.Format(time.RFC3339Nano), metadata["mtime"])
 	}
+}
+
+// TestNFCUnique checks nfcUnique's premise against the unicode tables: every
+// non-ASCII rune whose NFC form is all ASCII normalizes to one of ';', '`', 'K'.
+func TestNFCUnique(t *testing.T) {
+	for r := rune(utf8.RuneSelf); r <= unicode.MaxRune; r++ {
+		if !utf8.ValidRune(r) {
+			continue
+		}
+		if n := norm.NFC.String(string(r)); nfcUnique(n) {
+			t.Errorf("U+%04X normalizes to %q, which nfcUnique accepts", r, n)
+		}
+	}
+	assert.True(t, nfcUnique("videos-0123456789abcdef.mkv"))
+	assert.False(t, nfcUnique("K"))
+	assert.False(t, nfcUnique("café"))
 }
