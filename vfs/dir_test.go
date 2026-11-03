@@ -763,3 +763,31 @@ func TestDirMetadataExtension(t *testing.T) {
 		assert.Equal(t, modTime.Format(time.RFC3339Nano), metadata["mtime"])
 	}
 }
+
+// A miss on a differently-normalized name resolves through the nonNormal index
+// exactly as the old scan of items did, and the index follows adds and removes.
+func TestDirStatNormalized(t *testing.T) {
+	_, _, dir, _ := dirCreate(t)
+	nfc, nfd, other := "caf\u00e9", "cafe\u0301", "cafe\u0341" // all NFC to nfc
+
+	dir.AddVirtual(nfd, 1, false) // stored non-normal: found via nonNormal
+	node, err := dir.Stat(nfc)
+	require.NoError(t, err)
+	assert.Equal(t, nfd, node.Name())
+	dir.delObject(nfd)
+	_, err = dir.Stat(nfc)
+	assert.Equal(t, ENOENT, err)
+	assert.Empty(t, dir.nonNormal)
+
+	dir.AddVirtual(nfc, 2, false) // stored normal: found via items[normalized]
+	node, err = dir.Stat(nfd)
+	require.NoError(t, err)
+	assert.Equal(t, nfc, node.Name())
+
+	dir.AddVirtual(nfd, 1, false) // two stored names normalize alike
+	_, err = dir.Stat(other)
+	assert.ErrorContains(t, err, "duplicate filename")
+	node, err = dir.Stat(nfd) // an exact hit still wins
+	require.NoError(t, err)
+	assert.Equal(t, nfd, node.Name())
+}
