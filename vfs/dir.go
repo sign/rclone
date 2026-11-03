@@ -5,12 +5,12 @@ import (
 	"fmt"
 	"os"
 	"path"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
-	"unicode/utf8"
 
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/dirtree"
@@ -37,7 +37,10 @@ type Dir struct {
 	read    time.Time         // time directory entry last read
 	items   map[string]Node   // directory entries - can be empty but not nil
 	virtual map[string]vState // virtual directory entries - may be nil
-	sys     atomic.Value      // user defined info to be attached here
+	// nonNormal maps a normalized name to the names in items that normalize to it but
+	// differ from it, so a lookup miss needs no scan of items - may be nil
+	nonNormal map[string][]string
+	sys       atomic.Value // user defined info to be attached here
 
 	modTimeMu sync.Mutex // protects the following
 	modTime   time.Time
@@ -250,6 +253,7 @@ func (d *Dir) ForgetAll() (hasVirtual bool) {
 	if !hasVirtual {
 		d.read = time.Time{}
 		d.items = make(map[string]Node)
+		d.nonNormal = nil
 		d.cleanupTimer.Stop()
 	} else {
 		d.cleanupTimer.Reset(time.Duration(d.vfs.Opt.DirCacheTime * 2))
@@ -377,9 +381,9 @@ func (d *Dir) renameTree(dirPath string) {
 	// Make sure the path is correct for each node
 	if d.path != dirPath {
 		fs.Debugf(d.path, "Renaming to %q", dirPath)
-		delete(d.parent.items, name(d.path))
+		d.parent._delItem(name(d.path))
 		d.path = dirPath
-		d.parent.items[name(d.path)] = d
+		d.parent._setItem(name(d.path), d)
 		d.entry = fs.NewDirCopy(d.vfs.ctx, d.entry).SetRemote(dirPath)
 	}
 
@@ -412,8 +416,8 @@ func (d *Dir) rename(newParent *Dir, fsDir fs.Directory) {
 	d.entry = fsDir
 	d.path = fsDir.Remote()
 	newPath := d.path
-	delete(d.parent.items, name(oldPath))
-	d.parent.items[name(d.path)] = d
+	d.parent._delItem(name(oldPath))
+	d.parent._setItem(name(d.path), d)
 	d.read = time.Time{}
 	d.mu.Unlock()
 
@@ -437,6 +441,44 @@ func name(p string) string {
 	return p
 }
 
+// toNormal normalizes name as the case/unicode settings ask; ok is false when
+// neither is on, so names match exactly
+func (d *Dir) toNormal(name string) (normalized string, ok bool) {
+	ci := fs.GetConfig(d.vfs.ctx)
+	normUnicode := !ci.NoUnicodeNormalization
+	normCase := ci.IgnoreCaseSync || d.vfs.Opt.CaseInsensitive
+	if !normUnicode && !normCase {
+		return name, false
+	}
+	return operations.ToNormal(name, normUnicode, normCase), true
+}
+
+// _setItem sets items[leaf], keeping nonNormal in sync - call with the lock held
+func (d *Dir) _setItem(leaf string, node Node) {
+	if _, found := d.items[leaf]; !found {
+		if n, ok := d.toNormal(leaf); ok && n != leaf {
+			if d.nonNormal == nil {
+				d.nonNormal = make(map[string][]string)
+			}
+			d.nonNormal[n] = append(d.nonNormal[n], leaf)
+		}
+	}
+	d.items[leaf] = node
+}
+
+// _delItem deletes items[leaf], keeping nonNormal in sync - call with the lock held
+func (d *Dir) _delItem(leaf string) {
+	if _, found := d.items[leaf]; found {
+		if n, ok := d.toNormal(leaf); ok && n != leaf {
+			d.nonNormal[n] = slices.DeleteFunc(d.nonNormal[n], func(s string) bool { return s == leaf })
+			if len(d.nonNormal[n]) == 0 {
+				delete(d.nonNormal, n)
+			}
+		}
+	}
+	delete(d.items, leaf)
+}
+
 // addObject adds a new object or directory to the directory
 //
 // The name passed in is marked as virtual as it hasn't been read from a remote
@@ -446,7 +488,7 @@ func name(p string) string {
 func (d *Dir) addObject(node Node) {
 	d.mu.Lock()
 	leaf := node.Name()
-	d.items[leaf] = node
+	d._setItem(leaf, node)
 	if d.virtual == nil {
 		d.virtual = make(map[string]vState)
 	}
@@ -506,7 +548,7 @@ func (d *Dir) AddVirtual(leaf string, size int64, isDir bool) {
 // from a remote directory listing.
 func (d *Dir) delObject(leaf string) {
 	d.mu.Lock()
-	delete(d.items, leaf)
+	d._delItem(leaf)
 	if d.virtual == nil {
 		d.virtual = make(map[string]vState)
 	}
@@ -711,7 +753,7 @@ func (mv manageVirtuals) end(d *Dir) {
 				// virtually added so leave virtual item
 			default:
 				// otherwise delete it
-				delete(d.items, name)
+				d._delItem(name)
 			}
 		}
 	}
@@ -781,7 +823,7 @@ func (d *Dir) _readDirFromEntries(entries fs.DirEntries, dirTree dirtree.DirTree
 			fs.Errorf(d, "readDir error: %v", err)
 			return err
 		}
-		d.items[name] = node
+		d._setItem(name, node)
 	}
 	mv.end(d)
 	return nil
@@ -892,45 +934,35 @@ func (d *Dir) stat(leaf string) (Node, error) {
 		}
 	}
 
-	ci := fs.GetConfig(d.vfs.ctx)
-	normUnicode := !ci.NoUnicodeNormalization
-	normCase := ci.IgnoreCaseSync || d.vfs.Opt.CaseInsensitive
-	// skip the O(items) scan when no other name can normalize to leaf: on a
-	// 3.3M-entry dir each miss otherwise holds d.mu for ~1s and wedges the mount
-	if !ok && (normCase || (normUnicode && !nfcUnique(leaf))) {
-		leafNormalized := operations.ToNormal(leaf, normUnicode, normCase) // this handles both case and unicode normalization
-		d.mu.Lock()
-		for name, node := range d.items {
-			if operations.ToNormal(name, normUnicode, normCase) == leafNormalized {
-				if ok {
-					// duplicate normalized match is an error
-					d.mu.Unlock()
-					return nil, fmt.Errorf("duplicate filename %q detected with case/unicode normalization settings", leaf)
-				}
-				// found a normalized match
-				ok = true
-				item = node
-			}
+	// a name matching leaf after normalization is either the normalized name
+	// itself or one of nonNormal's - no scan of items
+	if !ok {
+		leafNormalized, normOn := d.toNormal(leaf)
+		if !normOn {
+			return nil, ENOENT
 		}
-		d.mu.Unlock()
+		d.mu.RLock()
+		var matches []Node
+		if node, found := d.items[leafNormalized]; found {
+			matches = append(matches, node)
+		}
+		for _, name := range d.nonNormal[leafNormalized] {
+			matches = append(matches, d.items[name])
+		}
+		d.mu.RUnlock()
+		if len(matches) > 1 {
+			// duplicate normalized match is an error
+			return nil, fmt.Errorf("duplicate filename %q detected with case/unicode normalization settings", leaf)
+		}
+		if len(matches) == 1 {
+			ok, item = true, matches[0]
+		}
 	}
 
 	if !ok {
 		return nil, ENOENT
 	}
 	return item, nil
-}
-
-// nfcUnique reports whether no string other than s NFC-normalizes to s: true for
-// ASCII without ';', '`' and 'K', the only ASCII targets of non-ASCII runes
-// (the canonical singletons U+037E, U+1FEF, U+212A). TestNFCUnique checks this.
-func nfcUnique(s string) bool {
-	for i := 0; i < len(s); i++ {
-		if c := s[i]; c >= utf8.RuneSelf || c == ';' || c == '`' || c == 'K' {
-			return false
-		}
-	}
-	return true
 }
 
 // Check to see if a directory is empty

@@ -10,8 +10,6 @@ import (
 	"sort"
 	"testing"
 	"time"
-	"unicode"
-	"unicode/utf8"
 	"unsafe"
 
 	"github.com/rclone/rclone/fs"
@@ -19,7 +17,6 @@ import (
 	"github.com/rclone/rclone/fstest"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"golang.org/x/text/unicode/norm"
 )
 
 func dirCreate(t *testing.T) (r *fstest.Run, vfs *VFS, dir *Dir, item fstest.Item) {
@@ -767,18 +764,30 @@ func TestDirMetadataExtension(t *testing.T) {
 	}
 }
 
-// TestNFCUnique checks nfcUnique's premise against the unicode tables: every
-// non-ASCII rune whose NFC form is all ASCII normalizes to one of ';', '`', 'K'.
-func TestNFCUnique(t *testing.T) {
-	for r := rune(utf8.RuneSelf); r <= unicode.MaxRune; r++ {
-		if !utf8.ValidRune(r) {
-			continue
-		}
-		if n := norm.NFC.String(string(r)); nfcUnique(n) {
-			t.Errorf("U+%04X normalizes to %q, which nfcUnique accepts", r, n)
-		}
-	}
-	assert.True(t, nfcUnique("videos-0123456789abcdef.mkv"))
-	assert.False(t, nfcUnique("K"))
-	assert.False(t, nfcUnique("café"))
+// A miss on a differently-normalized name resolves through the nonNormal index
+// exactly as the old scan of items did, and the index follows adds and removes.
+func TestDirStatNormalized(t *testing.T) {
+	_, _, dir, _ := dirCreate(t)
+	nfc, nfd, other := "caf\u00e9", "cafe\u0301", "cafe\u0341" // all NFC to nfc
+
+	dir.AddVirtual(nfd, 1, false) // stored non-normal: found via nonNormal
+	node, err := dir.Stat(nfc)
+	require.NoError(t, err)
+	assert.Equal(t, nfd, node.Name())
+	dir.delObject(nfd)
+	_, err = dir.Stat(nfc)
+	assert.Equal(t, ENOENT, err)
+	assert.Empty(t, dir.nonNormal)
+
+	dir.AddVirtual(nfc, 2, false) // stored normal: found via items[normalized]
+	node, err = dir.Stat(nfd)
+	require.NoError(t, err)
+	assert.Equal(t, nfc, node.Name())
+
+	dir.AddVirtual(nfd, 1, false) // two stored names normalize alike
+	_, err = dir.Stat(other)
+	assert.ErrorContains(t, err, "duplicate filename")
+	node, err = dir.Stat(nfd) // an exact hit still wins
+	require.NoError(t, err)
+	assert.Equal(t, nfd, node.Name())
 }
